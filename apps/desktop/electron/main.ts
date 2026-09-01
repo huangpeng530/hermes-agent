@@ -13,12 +13,12 @@ import {
   BrowserWindow,
   clipboard,
   dialog,
-  net as electronNet,
-  webContents as electronWebContents,
   globalShortcut,
   ipcMain,
   Menu,
+  nativeImage,
   nativeTheme,
+  net as electronNet,
   Notification,
   powerMonitor,
   powerSaveBlocker,
@@ -27,7 +27,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
@@ -1378,6 +1379,57 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+// Module-level tray reference for Windows (enables icon state updates and menu refresh)
+let systemTray: Tray | null = null
+// Track notification count for tray badge
+let unreadNotificationCount = 0
+/** Rebuild the tray context menu reflecting current window/notification state */
+function rebuildContextMenu() {
+  if (!systemTray) return
+  const isHidden = !mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || !mainWindow.isVisible()
+  systemTray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: isHidden ? '打开 Hermes' : '最小化到托盘',
+      click: () => {
+        if (isHidden) {
+          mainWindow?.show()
+          mainWindow?.focus()
+        } else {
+          mainWindow?.minimize()
+        }
+      }
+    },
+    { type: 'separator' },
+    {
+      label: '设置',
+      click: () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        mainWindow.show()
+        mainWindow.focus()
+        mainWindow.webContents.executeJavaScript(`(function(){ window.location.hash="#/settings"; })()`)
+      }
+    },
+    {
+      label: unreadNotificationCount > 0
+        ? `通知 (${unreadNotificationCount})`
+        : '查看通知',
+      click: () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        mainWindow.show()
+        mainWindow.focus()
+        mainWindow.webContents.send('hermes:tray-notify-click', { count: unreadNotificationCount })
+      }
+    },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        if (mainWindow) { mainWindow.destroy(); mainWindow = null }
+        app.quit()
+      }
+    }
+  ]))
+}
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -14025,17 +14077,24 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
-  mainWindow.on('minimize', () => sendWindowStateChanged())
-  mainWindow.on('restore', () => sendWindowStateChanged())
-  mainWindow.on('hide', () => sendWindowStateChanged())
-  mainWindow.on('show', () => sendWindowStateChanged())
+  mainWindow.on('minimize', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
+  mainWindow.on('restore', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
+  mainWindow.on('hide', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
+  mainWindow.on('show', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
 
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', (event) => {
+    // On Windows with tray: close the window but stay alive in the tray icon
+    if (IS_WINDOWS && systemTray) {
+      event.preventDefault()
+      mainWindow.hide()
+    }
+    schedulePersistWindowState.flush()
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   mainWindow.on('closed', () => {
@@ -14046,6 +14105,11 @@ function createWindow() {
       mainWindow = null
       // the replacement renderer must register before queued links can be delivered.
       _rendererReadyForDeepLink = false
+    }
+
+    // After closing, refresh the tray menu if the window is gone
+    if (systemTray && (!mainWindow || mainWindow.isDestroyed())) {
+      rebuildContextMenu()
     }
   })
 
@@ -16135,6 +16199,12 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   })
   notification.show()
 
+  // Update tray badge when a new non-silent notification arrives
+  if (!payload?.silent && systemTray) {
+    unreadNotificationCount++
+    rebuildContextMenu()
+  }
+
   return true
 })
 
@@ -17405,6 +17475,55 @@ app.whenReady().then(() => {
   void resumeManagedSshRecoveries()
   createWindow()
 
+  // Enhanced System tray icon for Windows (minimize-to-tray + notification state)
+  if (IS_WINDOWS) {
+    const TRAY_ENABLED = process.env.HERMES_DESKTOP_TRAY !== 'false'
+    console.log('[hermes] [tray] Windows tray check: TRAY_ENABLED=' + TRAY_ENABLED)
+    if (TRAY_ENABLED) {
+      try {
+        // Packaged: APP_ROOT = 'resources/app.asar', assets at 'resources/app.asar.unpacked/assets/'
+        // Dev: APP_ROOT = 'dist', assets at project root 'assets/'
+        let appRootForTray
+        if (IS_PACKAGED) {
+          const resourcesDir = APP_ROOT.endsWith('app.asar') ? APP_ROOT.replace(/app\.asar$/, '') : APP_ROOT
+          appRootForTray = require('path').join(resourcesDir, 'app.asar.unpacked')
+        } else {
+          appRootForTray = require('path').resolve(APP_ROOT, '../..')
+        }
+        const trayIconPath = require('path').join(appRootForTray, 'assets', 'icon-tray.png')
+        const iconExists = require('fs').existsSync(trayIconPath)
+        console.log('[hermes] [tray] Creating tray with icon: ' + trayIconPath)
+        console.log('[hermes] [tray] Icon exists: ' + iconExists)
+        if (iconExists) {
+          systemTray = new Tray(nativeImage.createFromPath(trayIconPath))
+          console.log('[hermes] [tray] Tray created successfully')
+
+          systemTray.setToolTip('Hermes Agent — 点击打开')
+          rebuildContextMenu()
+          systemTray.on('click', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) {
+              createWindow()
+            } else if (mainWindow.isMinimized() || !mainWindow.isVisible()) {
+              mainWindow.show()
+              mainWindow.focus()
+            } else {
+              mainWindow.minimize()
+            }
+          })
+          // Double-click always restores the window
+          systemTray.on('double-click', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+            else { mainWindow.show(); mainWindow.focus() }
+          })
+        } else {
+          console.warn('[hermes] [tray] Icon file not found!')
+        }
+      } catch (e) {
+        console.error('[hermes] [tray] Failed to create tray:', e)
+      }
+    }
+  }
+
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
 
@@ -17618,12 +17737,16 @@ app.on('before-quit', event => {
 
 app.on('window-all-closed', () => {
   // macOS convention: keep the process alive in the Dock when the user closes
-  // the last window. But when we're handing off to a detached updater / swap /
-  // uninstall script, the process MUST exit so the script can replace or remove
-  // the bundle and relaunch — without this the script's PID-wait spins to its
-  // full timeout and the user is left with an invisible app (or an uninstall
-  // that appears to do nothing).
-  if (process.platform !== 'darwin' || isQuittingForHandoff) {
+  // the last window.
+  // On Windows: minimize to tray instead of quitting, so the tray icon remains
+  // accessible and the app can still receive notifications.
+  if (process.platform === 'win32') {
+    if (mainWindow) {
+      mainWindow.hide()
+    } else {
+      app.quit()
+    }
+  } else if (isQuittingForHandoff) {
     app.quit()
   }
 })
