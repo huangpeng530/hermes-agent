@@ -13,12 +13,12 @@ import {
   BrowserWindow,
   clipboard,
   dialog,
+  net as electronNet,
   globalShortcut,
   ipcMain,
   Menu,
   nativeImage,
   nativeTheme,
-  net as electronNet,
   Notification,
   powerMonitor,
   powerSaveBlocker,
@@ -1401,53 +1401,64 @@ let mainWindow = null
 let systemTray: Tray | null = null
 // Track notification count for tray badge
 let unreadNotificationCount = 0
+
 /** Rebuild the tray context menu reflecting current window/notification state */
 function rebuildContextMenu() {
-  if (!systemTray) return
+  if (!systemTray) {
+    return
+  }
   const isHidden = !mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || !mainWindow.isVisible()
-  systemTray.setContextMenu(Menu.buildFromTemplate([
-    {
-      label: isHidden ? '打开 Hermes' : '最小化到托盘',
-      click: () => {
-        if (isHidden) {
-          mainWindow?.show()
-          mainWindow?.focus()
-        } else {
-          mainWindow?.minimize()
+  systemTray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: isHidden ? '打开 Hermes' : '最小化到托盘',
+        click: () => {
+          if (isHidden) {
+            mainWindow?.show()
+            mainWindow?.focus()
+          } else {
+            mainWindow?.minimize()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: '设置',
+        click: () => {
+          if (!mainWindow || mainWindow.isDestroyed()) {
+            return
+          }
+          mainWindow.show()
+          mainWindow.focus()
+          mainWindow.webContents.executeJavaScript(`(function(){ window.location.hash="#/settings"; })()`)
+        }
+      },
+      {
+        label: unreadNotificationCount > 0 ? `通知 (${unreadNotificationCount})` : '查看通知',
+        click: () => {
+          if (!mainWindow || mainWindow.isDestroyed()) {
+            return
+          }
+          mainWindow.show()
+          mainWindow.focus()
+          mainWindow.webContents.send('hermes:tray-notify-click', { count: unreadNotificationCount })
+        }
+      },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          if (mainWindow) {
+            mainWindow.destroy()
+            mainWindow = null
+          }
+          app.quit()
         }
       }
-    },
-    { type: 'separator' },
-    {
-      label: '设置',
-      click: () => {
-        if (!mainWindow || mainWindow.isDestroyed()) return
-        mainWindow.show()
-        mainWindow.focus()
-        mainWindow.webContents.executeJavaScript(`(function(){ window.location.hash="#/settings"; })()`)
-      }
-    },
-    {
-      label: unreadNotificationCount > 0
-        ? `通知 (${unreadNotificationCount})`
-        : '查看通知',
-      click: () => {
-        if (!mainWindow || mainWindow.isDestroyed()) return
-        mainWindow.show()
-        mainWindow.focus()
-        mainWindow.webContents.send('hermes:tray-notify-click', { count: unreadNotificationCount })
-      }
-    },
-    { type: 'separator' },
-    {
-      label: '退出',
-      click: () => {
-        if (mainWindow) { mainWindow.destroy(); mainWindow = null }
-        app.quit()
-      }
-    }
-  ]))
+    ])
+  )
 }
+
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -14596,22 +14607,47 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
-  mainWindow.on('minimize', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
-  mainWindow.on('restore', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
-  mainWindow.on('hide', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
-  mainWindow.on('show', () => { sendWindowStateChanged(); if (systemTray) rebuildContextMenu() })
+  mainWindow.on('minimize', () => {
+    sendWindowStateChanged()
+
+    if (systemTray) {
+      rebuildContextMenu()
+    }
+  })
+  mainWindow.on('restore', () => {
+    sendWindowStateChanged()
+
+    if (systemTray) {
+      rebuildContextMenu()
+    }
+  })
+  mainWindow.on('hide', () => {
+    sendWindowStateChanged()
+
+    if (systemTray) {
+      rebuildContextMenu()
+    }
+  })
+  mainWindow.on('show', () => {
+    sendWindowStateChanged()
+
+    if (systemTray) {
+      rebuildContextMenu()
+    }
+  })
 
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', (event) => {
+  mainWindow.on('close', event => {
     // On Windows with tray: close the window but stay alive in the tray icon
     if (IS_WINDOWS && systemTray) {
       event.preventDefault()
       mainWindow.hide()
     }
+
     schedulePersistWindowState.flush()
   })
 
@@ -18061,21 +18097,25 @@ app.whenReady().then(() => {
   if (IS_WINDOWS) {
     const TRAY_ENABLED = process.env.HERMES_DESKTOP_TRAY !== 'false'
     console.log('[hermes] [tray] Windows tray check: TRAY_ENABLED=' + TRAY_ENABLED)
+
     if (TRAY_ENABLED) {
       try {
         // Packaged: APP_ROOT = 'resources/app.asar', assets at 'resources/app.asar.unpacked/assets/'
         // Dev: APP_ROOT = 'dist', assets at project root 'assets/'
         let appRootForTray
+
         if (IS_PACKAGED) {
           const resourcesDir = APP_ROOT.endsWith('app.asar') ? APP_ROOT.replace(/app\.asar$/, '') : APP_ROOT
           appRootForTray = require('path').join(resourcesDir, 'app.asar.unpacked')
         } else {
           appRootForTray = require('path').resolve(APP_ROOT, '../..')
         }
+
         const trayIconPath = require('path').join(appRootForTray, 'assets', 'icon-tray.png')
         const iconExists = require('fs').existsSync(trayIconPath)
         console.log('[hermes] [tray] Creating tray with icon: ' + trayIconPath)
         console.log('[hermes] [tray] Icon exists: ' + iconExists)
+
         if (iconExists) {
           systemTray = new Tray(nativeImage.createFromPath(trayIconPath))
           console.log('[hermes] [tray] Tray created successfully')
@@ -18094,8 +18134,12 @@ app.whenReady().then(() => {
           })
           // Double-click always restores the window
           systemTray.on('double-click', () => {
-            if (!mainWindow || mainWindow.isDestroyed()) createWindow()
-            else { mainWindow.show(); mainWindow.focus() }
+            if (!mainWindow || mainWindow.isDestroyed()) {
+              createWindow()
+            } else {
+              mainWindow.show()
+              mainWindow.focus()
+            }
           })
         } else {
           console.warn('[hermes] [tray] Icon file not found!')
