@@ -13,6 +13,9 @@ hermes venv 的依赖（典型症状 `module 'aiohttp' has no attribute 'ClientS
 | `weixin_watchdog_launcher.bat` | 计划任务入口（日志重定向到 `%HERMES_HOME%\weixin\watchdog.stdout.log`） |
 | `deploy_weixin_watchdog.ps1` | 一键部署：拷脚本 + 建计划任务 `\Hermes_WeixinWatchdog`（每 10 分钟）+ 初始化状态 |
 
+## 无窗口运行
+计划任务动作是 `wscript.exe //B //Nologo WeixinWatchdog.vbs`（隐藏 cmd 风格 0 启动 bat）。**不要**把任务动作直接设成 `cmd.exe /c ...bat`——交互登录方式下每 10 分钟会在桌面闪一个控制台窗口。
+
 ## 部署（一次性）
 
 ```powershell
