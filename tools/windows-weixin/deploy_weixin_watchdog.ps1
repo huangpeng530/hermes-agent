@@ -23,7 +23,13 @@ New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 Copy-Item (Join-Path $src "venv_integrity.py")        $destDir -Force
 Copy-Item (Join-Path $src "weixin_watchdog.py")       $destDir -Force
 Copy-Item (Join-Path $src "weixin_watchdog_launcher.bat") $destDir -Force
-Write-Host "[1/3] scripts copied to $destDir"
+# generate the concrete (path-substituted) windowless VBS launcher
+$vbsTpl = Get-Content (Join-Path $src "WeixinWatchdog.vbs.template") -Raw
+$vbs = $vbsTpl.Replace("%HERMES_HOME%", $HermesHome.Replace("\","/")) `
+             .Replace("%PYTHONPATH%", "E:\HP530-Program Files\HermesAI\HermesCLI") `
+             .Replace("%BAT_PATH%", $batPath)
+Set-Content (Join-Path $destDir "WeixinWatchdog.vbs") $vbs -Encoding ASCII
+Write-Host "[1/3] scripts copied to $destDir (incl. WeixinWatchdog.vbs - windowless launcher)"
 
 # 2. scheduled task: every 10 min, interactive, user = current user
 $taskName  = "Hermes_WeixinWatchdog"
@@ -31,7 +37,10 @@ $batPath   = Join-Path $destDir "weixin_watchdog_launcher.bat"
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
-$action  = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$batPath`""
+$vbsPath = Join-Path $destDir "WeixinWatchdog.vbs"
+# wscript //B //Nologo = windowless (a bare cmd.exe action flashes a console window
+# in interactive mode - that was the "terminal pops up every 10 min" complaint)
+$action  = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "//B //Nologo `"$vbsPath`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration ([timespan]::MaxValue)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User $env:USERNAME | Out-Null
