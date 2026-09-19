@@ -376,6 +376,21 @@ def _goal_followup_after_turn(
 
 def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
     """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
+    # A successful turn closes any transient-failure episode: reset this session's auto-
+    # continuation attempt counter so the next real failure starts a fresh budget.
+    _key = str(session.get("session_key") or sid)
+    # A reasoning-stall turn ALSO reports "complete" (its answer is the promoted planning
+    # text, not an error) — so it must NOT reset its own breaker budget, or the stall
+    # continuation loop could never trip. Only a genuine, non-stall completion resets it.
+    _is_stall = bool(isinstance(st.result, dict) and st.result.get("reasoning_only_stall"))
+    with session["history_lock"]:
+        _tac = session.get("_transient_autocontinue_attempts")
+        if isinstance(_tac, dict):
+            _tac.pop(_key, None)
+        if not _is_stall:
+            _rs = session.get("_reasoning_stall_attempts")
+            if isinstance(_rs, dict):
+                _rs.pop(_key, None)
     try:
         from hermes_cli.loops import LoopManager
         loop_sid_key = session.get("session_key") or ""
@@ -441,6 +456,19 @@ def _run_post_turn_followups(
             _enqueue_prompt(session, steer, session.get("transport"))
     if _drain_queued_prompt(rid, sid, session):
         return
+    # Live-process transient stream failure: a concluded FAILED turn whose provider stream
+    # spent its transient-fault retry budget. Re-dispatch one continuation so the interrupted
+    # work keeps going without a user re-prompt. (The crash-marker path in session.resume only
+    # covers PROCESS death; a handled failed turn clears its marker, so this live gap is
+    # separate.) Gated by desktop.transient_auto_continue + a per-episode attempt budget; no-ops
+    # on success, overflow episodes, non-transient reasons, or when a goal follow-up owns the slot.
+    if goal_followup is None:
+        _maybe_schedule_transient_auto_continue(rid, sid, session, result)
+        # Live-process reasoning-only stall: the turn reported "complete" but the model stopped
+        # mid-planning-monologue after real tool work — an unfinished task nothing else would
+        # continue. Self-gates (no-op unless result carries reasoning_only_stall), independent
+        # per-session budget from the transient path above.
+        _maybe_schedule_reasoning_stall_auto_continue(rid, sid, session, result)
     if goal_followup:
         with _session_turn_admission(session) as admitted:
             if not admitted or session.get("running"):
