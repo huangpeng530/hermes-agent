@@ -2128,6 +2128,25 @@ DEFAULT_CONFIG = {
         # auto-resume is SKIPPED for that boot (inbound messages still served). Gap-based chaining
         # also catches SLOW ~150s crash cycles. max_restarts=0 disables.
         "restart_loop_guard": {"max_restarts": 3, "window_seconds": 60, "max_gap_seconds": 300},
+        # Transient stream auto-continue (LIVE-process recovery, no restart involved): when a turn
+        # fails after the provider stream's retry budget is spent (thinking-stage ReadTimeout /
+        # peer-closed / 5xx — failure_reason timeout/overloaded/server_error/unknown), the session
+        # is marked resume_pending (reason "stream_exhausted") and an internal empty resume turn is
+        # queued, which the adapter's FIFO drains right after the failed turn — the interrupted
+        # the work continues without a user re-prompt. Bounded per failure episode by max_attempts
+        # (each auto-continuation is a full LLM session; the counter resets on any successful
+        # turn). enabled=false or max_attempts<=0: the durable marker is still set, so the user's
+        # next message auto-resumes with the recovery note (classic resume_pending behaviour).
+        "transient_auto_continue": {"enabled": True, "max_attempts": 3},
+        # Reasoning-only stall auto-continue (second live-process gap, no restart involved): a
+        # turn that ENDED "complete" but whose visible answer is a truncated planning monologue
+        # (model clean-stopped mid-thinking after real tool work — result flag
+        # ``reasoning_only_stall``, stamped by the agent core). The task is unfinished yet no
+        # failed-turn recovery ever fires, so the workflow silently stops. Marks resume_pending
+        # (reason "reasoning_stall") + queues one synthesized continuation; bounded per episode by
+        # max_attempts (a stall that stalls again re-enters the gate instead of resetting the
+        # budget); a genuine non-stall success resets the counter.
+        "reasoning_stall_auto_continue": {"enabled": True, "max_attempts": 3},
         # Respawn-storm circuit breaker (complements restart_loop_guard): counts (re)starts in a
         # sliding window and sleeps an exponential backoff before booting so a crash-looping
         # supervisor can't hammer the process. max_starts <= 0 disables. Env escape hatches:
@@ -2543,6 +2562,23 @@ DEFAULT_CONFIG = {
             "freshness_minutes": 15,
             "max_attempts": 2,  # Crash-loop breaker: max automatic re-runs of one interrupted turn.
         },
+        # Auto-continue a turn that died on a TRANSIENT provider stream failure (its retry budget
+        # spent: thinking-stage ReadTimeout / peer-closed mid-stream / 5xx overload) while the
+        # app/backend stayed up. The ``auto_continue`` above covers only PROCESS DEATH (crash
+        # markers at session.resume); a concluded failed turn clears its marker, so this live-
+        # process gap is separate — it is the "long thinking, stream drops, workflow stops, user
+        # must re-prompt" case. Re-submits a continuation prompt on the same session; bounded per
+        # failure episode by max_attempts (the counter resets on any successful turn).
+        # 0 or enabled=false: the failed turn's error text stands, the user resends manually.
+        "transient_auto_continue": {"enabled": True, "max_attempts": 5},
+        # Auto-continue a turn that STALLED on a reasoning-only clean stop: the model's final
+        # response is an incomplete planning monologue (thinking cut mid-plan, zero tool calls in
+        # the closing call) after real tool work — the task is NOT done but the turn reports
+        # "complete", so nothing else ever continues it. Covers the second "workflow just stops"
+        # failure class next to the transient stream drop above. Bounded per episode by
+        # max_attempts (a repeated stall is a budget-protected stop, not a loop); reset on a
+        # genuinely successful turn. 0/enabled=false: the promoted planning text stands.
+        "reasoning_stall_auto_continue": {"enabled": True, "max_attempts": 3},
     },
 
     "nous": {

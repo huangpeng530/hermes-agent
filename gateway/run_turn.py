@@ -23,7 +23,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -164,7 +164,19 @@ def hygiene_no_commit_reason(agent) -> str:
 
 
 class GatewayTurnMixin:
-    """Agent-turn execution for GatewayRunner (see module docstring)."""
+    """Turn execution for GatewayRunner: agent launch, response shaping, delivery, proxy path."""
+
+    # failure_reason values whose terminal failed turns are worth an AUTO-continuation:
+    # the provider stream's retry budget was spent on a TRANSIENT fault (thinking-stage
+    # ReadTimeout, peer-closed, 5xx overload). Every value here is classified retryable,
+    # so the main loop already did its own backoff/rotation/fallback first — reaching here
+    # means the whole budget was genuinely exhausted, not a client error (4xx/401/billing
+    # are non-retryable and never appear).
+    _TRANSIENT_AUTOCONTINUE_REASONS = frozenset(
+        {"timeout", "overloaded", "server_error", "unknown"})
+
+    # Default auto-continuation budget per failure episode when the config section is absent.
+    _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS = 3
 
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
@@ -1543,10 +1555,16 @@ class GatewayTurnMixin:
         # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
             await self._clear_restart_failure_count(session_key)
+            self._transient_autocontinue_budget().pop(session_key, None)
+            # A reasoning-stall turn also reports "complete" (its answer is the promoted
+            # planning text), so it must NOT clear its own stall budget or the breaker could
+            # never trip; only a genuine non-stall completion resets it.
+            if not agent_result.get("reasoning_only_stall"):
+                self._reasoning_stall_autocontinue_budget().pop(session_key, None)
             try:
                 await self.async_session_store.clear_resume_pending(session_key)
             except Exception as _e:
-                logger.debug("clear_resume_pending failed for %s: %s", session_key, _e)
+                logger.debug("clear_resume_pending failed for session %s: %s", session_key, _e)
 
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
@@ -1741,6 +1759,164 @@ class GatewayTurnMixin:
                 session_entry.session_id, agent_result.get("error", "processing incomplete"),
             )
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
+
+    # ── Transient stream auto-continue ──────────────────────────────────────────────────────
+    # The LIVE-process gap the crash/restart markers don't cover: the provider stream's own
+    # retry budget (HERMES_STREAM_RETRIES) and the main loop's backoff/rotation/fallback are
+    # all spent, the turn dies as a failed result while the gateway process stays up. No
+    # resume_pending marker is set, so nothing auto-resumes — the user has to re-prompt. The
+    # methods below close that gap: durable marker + a synthesized internal resume turn that
+    # the adapter's FIFO drains right after the failed turn.
+
+    def _transient_autocontinue_budget(self) -> dict:
+        """Per-session consecutive-auto-continuation counters (lazily created)."""
+        st = getattr(self, "_transient_autocontinue_attempts", None)
+        if st is None:
+            st = self._transient_autocontinue_attempts = {}
+        return st
+
+    def _transient_auto_continue_config(self) -> Tuple[bool, int]:
+        """(enabled, max_attempts) from gateway.transient_auto_continue; defaults when absent."""
+        try:
+            from gateway.run import _load_gateway_config
+            section = (_load_gateway_config().get("gateway") or {}).get("transient_auto_continue") or {}
+            if not isinstance(section, dict):
+                section = {}
+            enabled = bool(section.get("enabled", True))
+            try:
+                max_attempts = int(section.get("max_attempts", self._TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS))
+            except (TypeError, ValueError):
+                max_attempts = self._TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS
+        except Exception:
+            enabled, max_attempts = True, self._TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS
+        return enabled, max_attempts
+
+    async def _hmwa_maybe_transient_auto_continue(self, agent_result, source, session_key, session_entry):
+        """Auto-continue the interrupted work after a transiently failed turn (no user re-prompt).
+
+        Marks the session ``resume_pending`` (reason ``"stream_exhausted"`` — durable, so a
+        later crash/restart or the user's next message still resumes it) and queues one
+        synthesized empty internal turn. While the failed turn still holds the session slot
+        the busy handler queues it behind the active turn and the adapter drains it as the
+        follow-up turn; when idle, ``handle_message`` spawns it immediately. The freshness
+        gate (``agent.gateway_auto_continue_freshness``) and the attempt budget bound cost;
+        a successful turn clears both the marker and the counter. Returns
+        ``(attempt, max_attempts)`` when a continuation was queued, else None."""
+        if not isinstance(agent_result, dict) or not agent_result.get("failed") or not session_key:
+            return None
+        # Overflow episodes own their own recovery (auto-reset / retry-next-message) — never
+        # an immediate continuation.
+        if agent_result.get("compression_exhausted") or agent_result.get("compression_deferred"):
+            return None
+        reason = str(agent_result.get("failure_reason") or "")
+        if reason not in self._TRANSIENT_AUTOCONTINUE_REASONS:
+            return None
+        enabled, max_attempts = self._transient_auto_continue_config()
+        attempts = self._transient_autocontinue_budget()
+        count = int(attempts.get(session_key, 0))
+        try:
+            await self.async_session_store.mark_resume_pending(session_key, reason="stream_exhausted")
+        except Exception:
+            logger.debug("transient auto-continue: mark_resume_pending failed for %s", session_key,
+                         exc_info=True)
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            logger.info(
+                "Transient stream failure (reason=%s) on session %s — auto-continuation NOT "
+                "scheduled (enabled=%s max=%d count=%d); the durable resume marker keeps the "
+                "next message resuming with the recovery note.",
+                reason, session_key, enabled, max_attempts, count)
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.warning(
+                "Transient stream failure (reason=%s) on session %s — no live adapter for %s; "
+                "durable resume marker only.", reason, session_key,
+                getattr(getattr(source, "platform", None), "value", source.platform),
+            )
+            return None
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+        with suppress(Exception):
+            await adapter.handle_message(event)
+        attempts[session_key] = count + 1
+        logger.info(
+            "Transient stream failure (reason=%s) on session %s — auto-continuing via queued "
+            "resume turn (attempt %d/%d).", reason, session_key, count + 1, max_attempts)
+        return (count + 1, max_attempts)
+
+    # ── Reasoning-only stall auto-continue (second live-process gap) ───────────────────────
+    # The turn reported "complete" but its visible answer is a truncated planning monologue:
+    # the model clean-stopped mid-thinking after real tool work (agent-core flag
+    # ``reasoning_only_stall``). No FAILED-turn recovery ever fires for it, so the unfinished
+    # task would just sit there. Same durable-marker + queued-continuation shape as the
+    # transient path above, on its own per-episode budget.
+
+    def _reasoning_stall_autocontinue_budget(self) -> dict:
+        """Per-session reasoning-stall auto-continuation counters (lazily created)."""
+        st = getattr(self, "_reasoning_stall_autocontinue_attempts", None)
+        if st is None:
+            st = self._reasoning_stall_autocontinue_attempts = {}
+        return st
+
+    def _reasoning_stall_auto_continue_config(self) -> Tuple[bool, int]:
+        """(enabled, max_attempts) from gateway.reasoning_stall_auto_continue; defaults when absent."""
+        try:
+            from gateway.run import _load_gateway_config
+            section = (_load_gateway_config().get("gateway") or {}).get("reasoning_stall_auto_continue") or {}
+            if not isinstance(section, dict):
+                section = {}
+            enabled = bool(section.get("enabled", True))
+            try:
+                max_attempts = int(section.get("max_attempts", 3))
+            except (TypeError, ValueError):
+                max_attempts = 3
+        except Exception:
+            enabled, max_attempts = True, 3
+        return enabled, max_attempts
+
+    async def _hmwa_maybe_reasoning_stall_auto_continue(self, agent_result, source, session_key, session_entry):
+        """Auto-continue an UNFINISHED task after a reasoning-only stall (turn reported
+        "complete" but the model stopped mid-planning-monologue after real tool work).
+
+        Marks the session ``resume_pending`` (reason ``"reasoning_stall"`` — durable, so a later
+        crash/boot or the user's next message still resumes it) and queues one synthesized empty
+        internal continuation turn, which the adapter FIFO drains right after this turn. Gated by
+        ``gateway.reasoning_stall_auto_continue`` + a per-episode attempt budget that a genuine
+        non-stall success (not a stall that stalls again) resets. Returns ``(attempt, max)``
+        when a continuation was queued, else None."""
+        if not isinstance(agent_result, dict) or not agent_result.get("reasoning_only_stall") or not session_key:
+            return None
+        if agent_result.get("compression_exhausted") or agent_result.get("compression_deferred"):
+            return None
+        enabled, max_attempts = self._reasoning_stall_auto_continue_config()
+        attempts = self._reasoning_stall_autocontinue_budget()
+        count = int(attempts.get(session_key, 0))
+        try:
+            await self.async_session_store.mark_resume_pending(session_key, reason="reasoning_stall")
+        except Exception:
+            logger.debug("reasoning-stall auto-continue: mark_resume_pending failed for %s", session_key,
+                         exc_info=True)
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            logger.info(
+                "Reasoning stall on session %s — auto-continuation NOT scheduled (enabled=%s "
+                "max=%d count=%d); the durable resume marker keeps the next message resuming.",
+                session_key, enabled, max_attempts, count)
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.warning(
+                "Reasoning stall on session %s — no live adapter for %s; durable resume marker "
+                "only.", session_key,
+                getattr(getattr(source, "platform", None), "value", source.platform),
+            )
+            return None
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+        with suppress(Exception):
+            await adapter.handle_message(event)
+        attempts[session_key] = count + 1
+        logger.info(
+            "Reasoning stall on session %s — auto-continuing via queued resume turn "
+            "(attempt %d/%d).", session_key, count + 1, max_attempts)
+        return (count + 1, max_attempts)
 
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
@@ -2221,7 +2397,20 @@ class GatewayTurnMixin:
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
             if agent_failed_early and not is_context_overflow_failure:
-                response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
+                _transient_resume = await self._hmwa_maybe_transient_auto_continue(
+                    agent_result, source, session_key, session_entry)
+                _notice = self._hmwa_failed_turn_notice(agent_result)
+                if _transient_resume:
+                    _notice += (
+                        f" Resuming automatically (attempt {_transient_resume[0]}/{_transient_resume[1]}) "
+                        "— no need to resend.")
+                response = self._hmwa_add_failed_turn_notice(response, _notice)
+            # Second live-process gap, orthogonal to the failed-turn branch above: the turn
+            # reported "complete" yet its visible answer is a truncated planning monologue
+            # (reasoning-only clean stop after real tool work). Self-gates on the
+            # reasoning_only_stall flag; its own per-episode budget.
+            await self._hmwa_maybe_reasoning_stall_auto_continue(
+                agent_result, source, session_key, session_entry)
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )

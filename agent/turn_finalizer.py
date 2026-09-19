@@ -597,6 +597,15 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Machine-readable stall flag set by the reasoning-only clean-stop path
+    # (agent/turn_final_response.py): the turn ENDED "complete" but its visible answer is a
+    # truncated planning monologue after real tool work — an in-progress task that stopped
+    # mid-plan, not a finished reply. Live-process surfaces (desktop / gateway
+    # auto-continue) read this to re-queue one continuation turn. Consumed + reset here so a
+    # stale flag never leaks into the next turn's result.
+    if getattr(agent, "_reasoning_only_stall", False):
+        result["reasoning_only_stall"] = True
+        agent._reasoning_only_stall = False
     # Persistence failures already set failed=True; also stamp `error` so the gateway
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.

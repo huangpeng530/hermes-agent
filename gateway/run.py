@@ -1038,7 +1038,17 @@ def build_resume_recovery_note(
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
-        else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
+        else "a gateway shutdown" if reason == "shutdown_timeout"
+        else "a transient provider stream interruption" if reason == "stream_exhausted"
+        else "a model stall mid-thinking (turn ended without executing its next step)"
+        if reason == "reasoning_stall"
+        else "a gateway interruption")
+    # A stream interruption OR a reasoning-only stall resumed by an AUTO-synthesized (empty)
+    # message has no user in the loop by design: prompting "what would you like to do next"
+    # would recreate the exact manual re-prompt this recovery exists to remove. Force the
+    # continuation wording for both.
+    if not message and reason in ("stream_exhausted", "reasoning_stall"):
+        interactive = False
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
@@ -4032,7 +4042,14 @@ class GatewayRunner(
 
     # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by suspend_recently_active()
     # on crash recovery (no .clean_shutdown marker). All mean "killed mid-turn" -> startup auto-resume.
-    _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
+    # "stream_exhausted": live-process transient stream failure (retry budget spent); the same durable
+    # marker also rides a later crash/restart so boot auto-resume still recovers it.
+    # "reasoning_stall": live-process reasoning-only stall — turn reported "complete" but the model
+    # stopped mid-planning-monologue after real tool work (the unfinished-task class nothing else
+    # recovers).
+    _AUTO_RESUME_REASONS = frozenset(
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted",
+         "stream_exhausted", "reasoning_stall"})
 
     _MAX_SUPERVISED_RESTARTS = 5
     # Ran this long before crashing = HEALTHY (isolated crash, not a crash-loop); restart counter resets.
