@@ -86,6 +86,10 @@ def finish_text_response(
     # ``api_content`` sidecar, so the next turn still replays it byte-identically.
     _content = assistant_message.content
     _promoted = None
+    # Each text candidate decides the turn's outcome for the stall marker: reset first so a
+    # later real answer (e.g. after an empty-response ladder continuation) cannot inherit a
+    # stale flag from an earlier reasoning-only candidate.
+    agent._reasoning_only_stall = False
     if (
         finish_reason == "stop"
         and not assistant_message.tool_calls
@@ -93,13 +97,26 @@ def finish_text_response(
     ):
         _promoted = agent._extract_reasoning(assistant_message) or None
         if _promoted:
+            # Per-turn tool-work count: only the tool calls THIS turn made (after the triggering
+            # user message) — a clean stop with NONE of them is a genuine Q&A answer, not a stall.
+            _last_user = -1
+            for _i, _m in enumerate(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _last_user = _i
+            _turn_tool_calls = sum(
+                1 for _m in messages[_last_user + 1:]
+                if isinstance(_m, dict) and _m.get("role") == "assistant" and _m.get("tool_calls"))
+            # Machine-readable stall marker for live-process surfaces (desktop/gateway
+            # auto-continue): a reasoning-only clean stop AFTER real tool work this turn is a
+            # stalled in-progress task, not a legitimate answer. The finalizer stamps it into
+            # the result dict so those surfaces can re-queue one continuation.
+            agent._reasoning_only_stall = _turn_tool_calls > 0
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
             # (planning monologue, zero tool calls) while the turn reports "complete".
             logger.warning(
                 "Reasoning-only clean stop (%d chars) — returning the reasoning as the final "
                 "response (model=%s provider=%s api_calls=%d tool_turns=%d)",
-                len(_promoted), agent.model, agent.provider, api_call_count,
-                sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
+                len(_promoted), agent.model, agent.provider, api_call_count, _turn_tool_calls,
             )
     final_response = _promoted or assistant_message.content or ""
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
