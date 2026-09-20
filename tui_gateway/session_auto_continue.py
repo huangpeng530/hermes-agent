@@ -25,6 +25,12 @@ _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
 # genuinely exhausted, not a client error (4xx/401/billing are non-retryable and never appear).
 _TRANSIENT_AUTOCONTINUE_REASONS = frozenset({"timeout", "overloaded", "server_error", "unknown"})
 
+# An OWED auto-continue parked on the session is only re-fired while it is still relevant: if the
+# session goes idle for longer than this, the task has effectively been parked long enough that a
+# fresh user nudge (with a clean re-read of state) beats a stale blind "keep going". Matches the
+# crash-marker freshness default (15 min).
+_OWNED_MAX_AGE_SECONDS = 900
+
 
 def _transient_auto_continue_config() -> tuple[bool, int]:
     """(enabled, max_attempts) from ``desktop.transient_auto_continue``; defaults when absent."""
@@ -102,6 +108,93 @@ def _last_user_prompt_text(result: dict) -> str | None:
     return None
 
 
+def _session_has_human_turn_driving(session: dict) -> bool:
+    """True when the turn currently owning the slot is a HUMAN prompt (no machine display_kind).
+    A HUMAN turn is actively driving the task — it continues manually, so no owed auto-continue is
+    owed. Machine turns (process_complete / auto_continue / model_switch notification turns, the
+    bg-review skill-lib review, a sibling queued prompt) do NOT own the task; the task stays owed."""
+    inflight = session.get("inflight_turn")
+    return bool(isinstance(inflight, dict) and not inflight.get("display_kind"))
+
+
+def _record_owed_auto_continue(session, sid: str, kind: str, note: str, original, count: int,
+                               max_attempts: int) -> None:
+    """A continuation was OWED (the turn failed / reasoning-stalled) but a competing turn owns the
+    slot right now, so it couldn't be dispatched. Instead of dropping it (the silent-return that
+    left the GTA5 mod task stranded after its 11:58 stall), park it on the session so the next idle
+    boundary re-fires it. Bounded by the SAME per-episode attempt counter the scheduler uses, so it
+    cannot loop. A HUMAN turn driving the session makes the owed continuation stale — skip it.
+
+    CALL WITH session["history_lock"] HELD: both call sites run inside a ``_session_turn_admission``
+    block that already holds it, and the lock is a plain NON-reentrant ``threading.Lock()`` — so this
+    function must NOT acquire it again (that would self-deadlock)."""
+    if session.get("running") and _session_has_human_turn_driving(session):
+        return  # a human is actively driving the task — they continue it manually, no nudge owed
+    session["_owed_auto_continue"] = {
+        "kind": kind, "note": note, "original": original,
+        "at": time.time(), "count": int(count), "max": int(max_attempts),
+    }
+    logger.info(
+        "%s auto-continue OWED for session %s — a competing turn owns the slot now; the owed "
+        "continuation fires at the next idle boundary (budget %d/%d).",
+        kind, str(session.get("session_key") or sid), int(count) + 1, int(max_attempts))
+
+
+def _flush_owed_auto_continue(rid, sid: str, session: dict) -> None:
+    """Re-fire a parked owed auto-continue (see ``_record_owed_auto_continue``) at an idle boundary.
+    Driven by the notification poller every ~0.5s and by the post-turn followups path. No-ops when:
+    nothing is owed; the session is still running / a HUMAN turn is driving (the owed note is stale —
+    a human took over); or the attempt budget is already spent. On dispatch it consumes the marker
+    and runs ONE continuation nudge, exactly as the live scheduler would have."""
+    owed = session.get("_owed_auto_continue")
+    if not isinstance(owed, dict):
+        return
+    kind = owed.get("kind")
+    with session["history_lock"]:
+        if time.time() - float(owed.get("at", 0)) > _OWNED_MAX_AGE_SECONDS:
+            session.pop("_owed_auto_continue", None)
+            logger.info("owed %s auto-continue for %s dropped: parked for %.0fs (> %.0fs idle) — a "
+                        "stale blind continuation is worse than a fresh user nudge.",
+                        kind, str(session.get("session_key") or sid),
+                        time.time() - float(owed.get("at", 0)), _OWNED_MAX_AGE_SECONDS)
+            return
+        if session.get("running") or _session_has_human_turn_driving(session):
+            return  # still busy, or a human is driving — keep the owed marker, retry at the next idle poll
+        session.pop("_owed_auto_continue", None)
+        enabled, max_attempts = (
+            _reasoning_stall_auto_continue_config() if kind == "reasoning_stall"
+            else _transient_auto_continue_config())
+        attempts = session.setdefault(
+            "_reasoning_stall_attempts" if kind == "reasoning_stall" else "_transient_autocontinue_attempts", {})
+        key = str(session.get("session_key") or sid)
+        count = int(attempts.get(key, 0))
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            session["running"] = False
+            logger.info("owed %s auto-continue for %s dropped: attempt budget spent (%d/%d).",
+                        kind, key, count, max_attempts)
+            return
+        attempts[key] = count + 1
+        session["running"] = True
+        if owed.get("original"):
+            session["_auto_continue_prompt"] = owed["original"]
+    logger.info(
+        "%s auto-continue (owed) scheduled for session %s (attempt %d/%d) — re-firing a "
+        "continuation a competing turn had blocked.", kind, key, count + 1, max_attempts)
+    try:
+        _emit("status.update", sid, {
+            "kind": "process",
+            "text": (f"⚠️ Model stalled mid-thinking — resuming automatically (attempt {count + 1}/{max_attempts}). "
+                     "No need to resend.") if kind == "reasoning_stall"
+            else f"⚠️ Provider stream dropped — resuming automatically (attempt {count + 1}/{max_attempts}). No need to resend."})
+        _emit("message.start", sid)
+        _run_prompt_submit(rid, sid, session, owed.get("note") or _reasoning_stall_note(),
+                           display_kind="auto_continue")
+    except Exception as exc:
+        _hook_failure(f"owed {kind} auto-continue dispatch", exc)
+        with session["history_lock"]:
+            session["running"] = False
+
+
 def _maybe_schedule_transient_auto_continue(rid, sid: str, session: dict, result: Any) -> None:
     """Live-process gap the crash-marker path can't cover: the turn FAILED after the provider
     stream's transient-fault retry budget was spent while the app stayed up. Re-dispatch one
@@ -132,22 +225,42 @@ def _maybe_schedule_transient_auto_continue(rid, sid: str, session: dict, result
             "reason=%s); the failed turn's error text stands and the user resends manually.",
             key, enabled, max_attempts, count, reason)
         return
-    with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running"):
-            return  # a real user turn owns the session — it continues the work instead
-    attempts[key] = count + 1
     note = _transient_auto_continue_note(result)
     # If the continuation turn later dies in a PROCESS crash, the resume-time crash marker should
     # re-submit the ORIGINAL user prompt, not this note — hand the original prompt off through
     # _auto_continue_prompt so the next turn's _record_turn_marker records it.
     original = _last_user_prompt_text(result)
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            logger.info("transient auto-continue NOT scheduled for session %s: the backend is "
+                        "retiring; the failed turn's error text stands.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                logger.info("transient auto-continue NOT scheduled for session %s: a HUMAN turn "
+                            "owns the slot — it continues the interrupted work instead.", key)
+                return
+            _record_owed_auto_continue(session, sid, "transient", note, original, count, max_attempts)
+            return
+    attempts[key] = count + 1
     if original:
         with session["history_lock"]:
             session["_auto_continue_prompt"] = original
     with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running"):
+        if not admitted:
             attempts.pop(key, None)
-            return  # a real user turn claimed the slot first — it continues the work instead
+            logger.info("transient auto-continue NOT scheduled for session %s: the backend is "
+                        "retiring between the admission checks; no continuation this cycle.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                attempts.pop(key, None)
+                logger.info("transient auto-continue NOT scheduled for session %s: a HUMAN turn "
+                            "claimed the slot first — it continues the interrupted work instead.", key)
+                return
+            attempts.pop(key, None)
+            _record_owed_auto_continue(session, sid, "transient", note, original, count, max_attempts)
+            return
         session["running"] = True
     logger.info(
         "transient auto-continue scheduled for session %s (attempt %d/%d, reason=%s)",
@@ -193,21 +306,41 @@ def _maybe_schedule_reasoning_stall_auto_continue(rid, sid: str, session: dict, 
             "count=%d); the promoted planning text stands and the user nudges manually.",
             key, enabled, max_attempts, count)
         return
-    with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running"):
-            return  # a real user turn owns the session — it continues the work instead
-    attempts[key] = count + 1
     note = _reasoning_stall_note()
     # Same crash hand-off as the transient path: if this continuation later dies in a PROCESS
     # crash, the resume-time crash marker re-submits the ORIGINAL user task, not this nudge.
     original = _last_user_prompt_text(result)
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            logger.info("reasoning-stall auto-continue NOT scheduled for session %s: the backend "
+                        "is retiring; the promoted planning text stands.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                logger.info("reasoning-stall auto-continue NOT scheduled for session %s: a HUMAN "
+                            "turn owns the slot — it continues the task instead.", key)
+                return
+            _record_owed_auto_continue(session, sid, "reasoning_stall", note, original, count, max_attempts)
+            return
+    attempts[key] = count + 1
     if original:
         with session["history_lock"]:
             session["_auto_continue_prompt"] = original
     with _session_turn_admission(session) as admitted:
-        if not admitted or session.get("running"):
+        if not admitted:
             attempts.pop(key, None)
-            return  # a real user turn claimed the slot first — it continues the work instead
+            logger.info("reasoning-stall auto-continue NOT scheduled for session %s: the backend "
+                        "is retiring between the admission checks; no continuation this cycle.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                attempts.pop(key, None)
+                logger.info("reasoning-stall auto-continue NOT scheduled for session %s: a HUMAN "
+                            "turn claimed the slot first — it continues the task instead.", key)
+                return
+            attempts.pop(key, None)
+            _record_owed_auto_continue(session, sid, "reasoning_stall", note, original, count, max_attempts)
+            return
         session["running"] = True
     logger.info(
         "reasoning-stall auto-continue scheduled for session %s (attempt %d/%d)",
