@@ -714,6 +714,13 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
             _notif_poll_kanban(sid, session)
+        # Owed auto-continue re-fires at the idle boundary: a continuation a competing turn had
+        # blocked (the live schedulers park it via _record_owed_auto_continue) is re-dispatched here
+        # once the session goes idle. No-op unless an owed marker is parked and the slot is free.
+        try:
+            _flush_owed_auto_continue(f"__owed__{int(now * 1000)}", sid, session)
+        except Exception as _owed_exc:
+            _notif_log_failure("owed auto-continue flush failed", _owed_exc)
         try:
             evt = queue.get(timeout=0.5)
         except Exception:

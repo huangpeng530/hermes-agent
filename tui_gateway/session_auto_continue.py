@@ -5,6 +5,7 @@ busy-submit handling. Bodies are rebound onto server.py's globals at install tim
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
 from .method_ctx import bind_module
 
@@ -16,6 +17,347 @@ from .method_ctx import bind_module
 # done this for restart-interrupted sessions since #27856); if it's stale, clear the marker and let the
 # recovered partial transcript speak for itself — the user can ask to continue manually.
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
+
+# failure_reason values whose terminal failed turns are worth a live-process AUTO-continuation:
+# the provider stream's retry budget was spent on a TRANSIENT fault (thinking-stage ReadTimeout,
+# peer-closed mid-chunked, 5xx overload). Every value is classified retryable, so the main loop
+# already did its own backoff/rotation/fallback first — reaching here means the whole budget was
+# genuinely exhausted, not a client error (4xx/401/billing are non-retryable and never appear).
+_TRANSIENT_AUTOCONTINUE_REASONS = frozenset({"timeout", "overloaded", "server_error", "unknown"})
+
+# An OWED auto-continue parked on the session is only re-fired while it is still relevant: if the
+# session goes idle for longer than this, the task has effectively been parked long enough that a
+# fresh user nudge (with a clean re-read of state) beats a stale blind "keep going". Matches the
+# crash-marker freshness default (15 min).
+_OWNED_MAX_AGE_SECONDS = 900
+
+
+def _transient_auto_continue_config() -> tuple[bool, int]:
+    """(enabled, max_attempts) from ``desktop.transient_auto_continue``; defaults when absent."""
+    desktop = _load_cfg().get("desktop")
+    cfg = desktop.get("transient_auto_continue") if isinstance(desktop, dict) else None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    enabled = is_truthy_value(cfg.get("enabled"), default=True)
+    max_attempts = _coerce_int_config_value(cfg.get("max_attempts"), 5, min_value=0)
+    return enabled, max_attempts
+
+
+def _reasoning_stall_auto_continue_config() -> tuple[bool, int]:
+    """(enabled, max_attempts) from ``desktop.reasoning_stall_auto_continue``; defaults when absent."""
+    desktop = _load_cfg().get("desktop")
+    cfg = desktop.get("reasoning_stall_auto_continue") if isinstance(desktop, dict) else None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    enabled = is_truthy_value(cfg.get("enabled"), default=True)
+    max_attempts = _coerce_int_config_value(cfg.get("max_attempts"), 3, min_value=0)
+    return enabled, max_attempts
+
+
+def _reasoning_stall_note() -> str:
+    """Continuation nudge re-submitted after a reasoning-only stall.
+
+    Reuses the crash-continue note opener so transcript tooling classifies it as an
+    ``auto_continue`` row. Unlike the crash path the app is still up, the whole transcript is
+    intact and the ORIGINAL task is already in context — so this is a plain "keep going" nudge,
+    not a resubmission of the user's message.
+    """
+    return (
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the previous turn ended mid-thinking: the model stopped "
+        "after a planning monologue without executing its next step, so the task is NOT done. "
+        "Review the current state (last tool results in the history) and CONTINUE from the first "
+        "step that has no recorded result — do NOT re-run steps whose results already exist."
+    )
+
+
+def _transient_auto_continue_note(result: dict) -> str:
+    """Continuation prompt re-submitted after a live-process transient stream failure.
+
+    Reuses the crash-continue note opener so transcript tooling classifies it as an
+    ``auto_continue`` user row (not a real human message). Unlike the crash path the app is
+    still up and the full transcript (incl. every tool call + result so far) is intact, so the
+    instruction is "resume from the first step without a recorded result", never "start over".
+    """
+    reason = str(result.get("failure_reason") or "transient")
+    return (
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the model's provider stream dropped mid-run "
+        f"(transient {reason}) and its retry budget was exhausted, but the app is still running "
+        "and this conversation (every tool call and its result so far) is intact. Review the "
+        "current state and CONTINUE the interrupted task from the first step that has no "
+        "recorded result — do NOT re-run tool calls whose results already appear in the history."
+    )
+
+
+def _last_user_prompt_text(result: dict) -> str | None:
+    """Last real user message of a failed turn — the task to re-submit if a later PROCESS crash
+    leaves a marker on the continuation turn. Read off ``result['messages']`` (the persisted
+    conversation), so it survives even though the in-flight turn marker may already be retired.
+    Synthetic rows (auto-continue notes, model-switch markers, ...) carry a ``display_kind`` and
+    are skipped, so a chained continuation still hands off the ORIGINAL human task. Returns None
+    when there is no plain-text user message (image-only turn, no history yet)."""
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for msg in reversed(messages):
+        if not (isinstance(msg, dict) and msg.get("role") == "user"):
+            continue
+        if msg.get("display_kind") in ("auto_continue", "model_switch"):
+            continue  # a synthetic recovery row — the real task is further back
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        break
+    return None
+
+
+def _session_has_human_turn_driving(session: dict) -> bool:
+    """True when the turn currently owning the slot is a HUMAN prompt (no machine display_kind).
+    A HUMAN turn is actively driving the task — it continues manually, so no owed auto-continue is
+    owed. Machine turns (process_complete / auto_continue / model_switch notification turns, the
+    bg-review skill-lib review, a sibling queued prompt) do NOT own the task; the task stays owed."""
+    inflight = session.get("inflight_turn")
+    return bool(isinstance(inflight, dict) and not inflight.get("display_kind"))
+
+
+def _record_owed_auto_continue(session, sid: str, kind: str, note: str, original, count: int,
+                               max_attempts: int) -> None:
+    """A continuation was OWED (the turn failed / reasoning-stalled) but a competing turn owns the
+    slot right now, so it couldn't be dispatched. Instead of dropping it (the silent-return that
+    left the GTA5 mod task stranded after its 11:58 stall), park it on the session so the next idle
+    boundary re-fires it. Bounded by the SAME per-episode attempt counter the scheduler uses, so it
+    cannot loop. A HUMAN turn driving the session makes the owed continuation stale — skip it.
+
+    CALL WITH session["history_lock"] HELD: both call sites run inside a ``_session_turn_admission``
+    block that already holds it, and the lock is a plain NON-reentrant ``threading.Lock()`` — so this
+    function must NOT acquire it again (that would self-deadlock)."""
+    if session.get("running") and _session_has_human_turn_driving(session):
+        return  # a human is actively driving the task — they continue it manually, no nudge owed
+    session["_owed_auto_continue"] = {
+        "kind": kind, "note": note, "original": original,
+        "at": time.time(), "count": int(count), "max": int(max_attempts),
+    }
+    logger.info(
+        "%s auto-continue OWED for session %s — a competing turn owns the slot now; the owed "
+        "continuation fires at the next idle boundary (budget %d/%d).",
+        kind, str(session.get("session_key") or sid), int(count) + 1, int(max_attempts))
+
+
+def _flush_owed_auto_continue(rid, sid: str, session: dict) -> None:
+    """Re-fire a parked owed auto-continue (see ``_record_owed_auto_continue``) at an idle boundary.
+    Driven by the notification poller every ~0.5s and by the post-turn followups path. No-ops when:
+    nothing is owed; the session is still running / a HUMAN turn is driving (the owed note is stale —
+    a human took over); or the attempt budget is already spent. On dispatch it consumes the marker
+    and runs ONE continuation nudge, exactly as the live scheduler would have."""
+    owed = session.get("_owed_auto_continue")
+    if not isinstance(owed, dict):
+        return
+    kind = owed.get("kind")
+    with session["history_lock"]:
+        if time.time() - float(owed.get("at", 0)) > _OWNED_MAX_AGE_SECONDS:
+            session.pop("_owed_auto_continue", None)
+            logger.info("owed %s auto-continue for %s dropped: parked for %.0fs (> %.0fs idle) — a "
+                        "stale blind continuation is worse than a fresh user nudge.",
+                        kind, str(session.get("session_key") or sid),
+                        time.time() - float(owed.get("at", 0)), _OWNED_MAX_AGE_SECONDS)
+            return
+        if session.get("running") or _session_has_human_turn_driving(session):
+            return  # still busy, or a human is driving — keep the owed marker, retry at the next idle poll
+        session.pop("_owed_auto_continue", None)
+        enabled, max_attempts = (
+            _reasoning_stall_auto_continue_config() if kind == "reasoning_stall"
+            else _transient_auto_continue_config())
+        attempts = session.setdefault(
+            "_reasoning_stall_attempts" if kind == "reasoning_stall" else "_transient_autocontinue_attempts", {})
+        key = str(session.get("session_key") or sid)
+        count = int(attempts.get(key, 0))
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            session["running"] = False
+            logger.info("owed %s auto-continue for %s dropped: attempt budget spent (%d/%d).",
+                        kind, key, count, max_attempts)
+            return
+        attempts[key] = count + 1
+        session["running"] = True
+        if owed.get("original"):
+            session["_auto_continue_prompt"] = owed["original"]
+    logger.info(
+        "%s auto-continue (owed) scheduled for session %s (attempt %d/%d) — re-firing a "
+        "continuation a competing turn had blocked.", kind, key, count + 1, max_attempts)
+    try:
+        _emit("status.update", sid, {
+            "kind": "process",
+            "text": (f"⚠️ Model stalled mid-thinking — resuming automatically (attempt {count + 1}/{max_attempts}). "
+                     "No need to resend.") if kind == "reasoning_stall"
+            else f"⚠️ Provider stream dropped — resuming automatically (attempt {count + 1}/{max_attempts}). No need to resend."})
+        _emit("message.start", sid)
+        _run_prompt_submit(rid, sid, session, owed.get("note") or _reasoning_stall_note(),
+                           display_kind="auto_continue")
+    except Exception as exc:
+        _hook_failure(f"owed {kind} auto-continue dispatch", exc)
+        with session["history_lock"]:
+            session["running"] = False
+
+
+def _maybe_schedule_transient_auto_continue(rid, sid: str, session: dict, result: Any) -> None:
+    """Live-process gap the crash-marker path can't cover: the turn FAILED after the provider
+    stream's transient-fault retry budget was spent while the app stayed up. Re-dispatch one
+    continuation turn so the interrupted work keeps going without a user re-prompt.
+
+    Gated by ``desktop.transient_auto_continue`` and bounded per failure episode by a per-session
+    counter (``session["_transient_autocontinue_attempts"]``, reset on any successful turn).
+    Overflow episodes and non-transient reasons are never continued. No-op on success.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return
+    # Hosted-room (bot_room) turns own a durable task/lease recovery state machine — the crash path
+    # skips them for the same reason; a generic re-submit would duplicate its work.
+    if session.get("source") == "bot_room":
+        return
+    if result.get("compression_exhausted") or result.get("compression_deferred"):
+        return
+    reason = str(result.get("failure_reason") or "")
+    if reason not in _TRANSIENT_AUTOCONTINUE_REASONS:
+        return
+    enabled, max_attempts = _transient_auto_continue_config()
+    key = str(session.get("session_key") or sid)
+    attempts = session.setdefault("_transient_autocontinue_attempts", {})
+    count = int(attempts.get(key, 0))
+    if not enabled or max_attempts <= 0 or count >= max_attempts:
+        logger.info(
+            "transient auto-continue NOT scheduled for session %s (enabled=%s max=%d count=%d "
+            "reason=%s); the failed turn's error text stands and the user resends manually.",
+            key, enabled, max_attempts, count, reason)
+        return
+    note = _transient_auto_continue_note(result)
+    # If the continuation turn later dies in a PROCESS crash, the resume-time crash marker should
+    # re-submit the ORIGINAL user prompt, not this note — hand the original prompt off through
+    # _auto_continue_prompt so the next turn's _record_turn_marker records it.
+    original = _last_user_prompt_text(result)
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            logger.info("transient auto-continue NOT scheduled for session %s: the backend is "
+                        "retiring; the failed turn's error text stands.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                logger.info("transient auto-continue NOT scheduled for session %s: a HUMAN turn "
+                            "owns the slot — it continues the interrupted work instead.", key)
+                return
+            _record_owed_auto_continue(session, sid, "transient", note, original, count, max_attempts)
+            return
+    attempts[key] = count + 1
+    if original:
+        with session["history_lock"]:
+            session["_auto_continue_prompt"] = original
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            attempts.pop(key, None)
+            logger.info("transient auto-continue NOT scheduled for session %s: the backend is "
+                        "retiring between the admission checks; no continuation this cycle.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                attempts.pop(key, None)
+                logger.info("transient auto-continue NOT scheduled for session %s: a HUMAN turn "
+                            "claimed the slot first — it continues the interrupted work instead.", key)
+                return
+            attempts.pop(key, None)
+            _record_owed_auto_continue(session, sid, "transient", note, original, count, max_attempts)
+            return
+        session["running"] = True
+    logger.info(
+        "transient auto-continue scheduled for session %s (attempt %d/%d, reason=%s)",
+        key, count + 1, max_attempts, reason)
+    try:
+        _emit("status.update", sid, {
+            "kind": "process",
+            "text": f"⚠️ Provider stream dropped — resuming automatically "
+                    f"(attempt {count + 1}/{max_attempts}). No need to resend."})
+        _emit("message.start", sid)
+        # display_kind=auto_continue so the synthesized row is classified as a recovery note,
+        # never a human message (same as the crash-marker path).
+        _run_prompt_submit(rid, sid, session, note, display_kind="auto_continue")
+    except Exception as exc:
+        _hook_failure("transient stream auto-continue dispatch", exc)
+        with session["history_lock"]:
+            session["running"] = False
+
+
+def _maybe_schedule_reasoning_stall_auto_continue(rid, sid: str, session: dict, result: Any) -> None:
+    """Second live-process recovery class: the turn reported ``complete`` but its final
+    response is a REASONING-ONLY clean stop — the model stopped mid-planning-monologue after
+    real tool work (``result['reasoning_only_stall']``, stamped by the agent core when the
+    closing call had no visible content and no tool calls). The task is unfinished yet nothing
+    else would continue it; re-queue one continuation nudge so the work keeps going.
+
+    Gated by ``desktop.reasoning_stall_auto_continue`` and bounded per session by a separate
+    counter (``session["_reasoning_stall_attempts"]``; a stall-continuation that stalls again
+    re-enters this gate instead of resetting). Only clean successful turns clear the counter —
+    a stall turn must NOT clear its own budget, or the breaker could never trip.
+    """
+    if not isinstance(result, dict) or not result.get("reasoning_only_stall"):
+        return
+    if session.get("source") == "bot_room":
+        return
+    enabled, max_attempts = _reasoning_stall_auto_continue_config()
+    key = str(session.get("session_key") or sid)
+    attempts = session.setdefault("_reasoning_stall_attempts", {})
+    count = int(attempts.get(key, 0))
+    if not enabled or max_attempts <= 0 or count >= max_attempts:
+        logger.info(
+            "reasoning-stall auto-continue NOT scheduled for session %s (enabled=%s max=%d "
+            "count=%d); the promoted planning text stands and the user nudges manually.",
+            key, enabled, max_attempts, count)
+        return
+    note = _reasoning_stall_note()
+    # Same crash hand-off as the transient path: if this continuation later dies in a PROCESS
+    # crash, the resume-time crash marker re-submits the ORIGINAL user task, not this nudge.
+    original = _last_user_prompt_text(result)
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            logger.info("reasoning-stall auto-continue NOT scheduled for session %s: the backend "
+                        "is retiring; the promoted planning text stands.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                logger.info("reasoning-stall auto-continue NOT scheduled for session %s: a HUMAN "
+                            "turn owns the slot — it continues the task instead.", key)
+                return
+            _record_owed_auto_continue(session, sid, "reasoning_stall", note, original, count, max_attempts)
+            return
+    attempts[key] = count + 1
+    if original:
+        with session["history_lock"]:
+            session["_auto_continue_prompt"] = original
+    with _session_turn_admission(session) as admitted:
+        if not admitted:
+            attempts.pop(key, None)
+            logger.info("reasoning-stall auto-continue NOT scheduled for session %s: the backend "
+                        "is retiring between the admission checks; no continuation this cycle.", key)
+            return
+        if session.get("running"):
+            if _session_has_human_turn_driving(session):
+                attempts.pop(key, None)
+                logger.info("reasoning-stall auto-continue NOT scheduled for session %s: a HUMAN "
+                            "turn claimed the slot first — it continues the task instead.", key)
+                return
+            attempts.pop(key, None)
+            _record_owed_auto_continue(session, sid, "reasoning_stall", note, original, count, max_attempts)
+            return
+        session["running"] = True
+    logger.info(
+        "reasoning-stall auto-continue scheduled for session %s (attempt %d/%d)",
+        key, count + 1, max_attempts)
+    try:
+        _emit("status.update", sid, {
+            "kind": "process",
+            "text": f"⚠️ Model stalled mid-thinking — resuming automatically "
+                    f"(attempt {count + 1}/{max_attempts}). No need to resend."})
+        _emit("message.start", sid)
+        # display_kind=auto_continue so the synthesized nudge row is classified as a recovery
+        # note, never a human message (same as the crash-marker / transient paths).
+        _run_prompt_submit(rid, sid, session, note, display_kind="auto_continue")
+    except Exception as exc:
+        _hook_failure("reasoning-stall auto-continue dispatch", exc)
+        with session["history_lock"]:
+            session["running"] = False
 
 
 def _auto_continue_config() -> tuple[bool, float, int]:
