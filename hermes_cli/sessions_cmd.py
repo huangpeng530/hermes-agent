@@ -966,18 +966,30 @@ def _cmd_stats(db, args):
 
 
 def _cmd_timeline(db, args):
-    """Cross-compression prompt timeline: walk the compression lineage (root -> tip) and
-    join each segment's prompts, marking compression boundaries by their summary timestamp.
-    Read-only; every prompt carries its wall-clock timestamp, so it survives context
-    compaction of the *current* conversation (the ordering that gets lost in-memory)."""
+    """Cross-compression prompt timeline: two orthogonal compaction dimensions, both
+    read-only and every prompt carries its wall-clock timestamp (survives compaction of
+    the *current* conversation, whose in-memory ordering is what gets lost).
+
+    (1) lineage — rotation-style compaction (gateway / old arch): walk
+        parent_session_id chain root -> tip, mark each rotation by its summary timestamp.
+    (2) in-session — in-place compaction (agent ContextCompressor): the [CONTEXT
+        COMPACTION] summary marker rows pinned `_compressed_summary = 1`, which stay
+        inside one session_id. This is the dimension lineage-only views are blind to.
+    """
     from hermes_cli.session_filters import format_epoch
-    from hermes_state_timeline import get_session_timeline
+    from hermes_state_timeline import get_session_timeline, get_in_session_compressions
 
     limit = max(1, min(int(getattr(args, "limit", 200) or 200), 1000))
     segments = db.get_compression_lineage(db.resolve_session_id(args.session_id) or args.session_id)
     target = db.resolve_session_id(args.session_id)
     if not target:
         return _not_found(args.session_id)
+
+    def in_session_boundaries(sid):
+        """In-place compaction events via the shared reader (also backs the REST
+        endpoint, so the CLI and Desktop never drift apart)."""
+        return get_in_session_compressions(db, sid)
+
     data = {"session_id": target, "lineage": segments, "segments": []}
     for i, seg in enumerate(segments):
         sess = db.get_session(seg) or {}
@@ -988,7 +1000,7 @@ def _cmd_timeline(db, args):
         # segments before it only hold the pre-compaction prompts, which are few by
         # construction (their active window is what got compacted).
         cap = limit if seg == target else 1000
-        page, cursor = 0, 0
+        cursor = 0
         while True:
             got = get_session_timeline(db, seg, limit=cap, after_row_id=cursor)
             entries.extend(got["entries"])
@@ -999,40 +1011,38 @@ def _cmd_timeline(db, args):
             "session_id": seg, "title": sess.get("title"), "source": sess.get("source"),
             "started_at": sess.get("started_at"), "ended_at": sess.get("ended_at"),
             "model": sess.get("model"), "prompt_count": total,
-            "compacted": i > 0, "prompts": entries,
+            "compacted": i > 0, "in_session_boundaries": in_session_boundaries(seg),
+            "prompts": entries,
         })
     if getattr(args, "json", False):
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
         return
     if getattr(args, "segments", False):
-        # Compact view: boundary chain only, no prompts.
-        print(f"Session {target} — {len(segments)} compression segment(s):")
+        # Compact view: lineage chain + each segment's in-session compaction events.
+        print(f"Session {target} — {len(segments)} lineage segment(s):")
         for i, seg in enumerate(segments):
             s = db.get_session(seg) or {}
             label = " tip" if seg == target else (" root" if i == 0 else "")
             print(f"  [{i}] {seg}{label}  {format_epoch(s.get('started_at'))} -> "
                   f"{format_epoch(s.get('ended_at'))}  ({s.get('end_reason') or 'open'})")
+            for b in data["segments"][i]["in_session_boundaries"]:
+                gt = datetime.fromtimestamp(b["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                print(f"       ├─ in-session compression @ {gt}  {b['goal'][:70] or '(no goal line)'}")
         return
-    print(f"Session {target} — {len(segments)} compression segment(s), prompts with timestamps:")
+    print(f"Session {target} — {len(segments)} lineage segment(s), prompts with timestamps:")
     for i, seg in enumerate(segments):
         s = db.get_session(seg) or {}
         print(f"\n── segment {i + 1}/{len(segments)} · {seg} · {format_epoch(s.get('started_at'))} · "
               f"{s.get('source') or '-'} · {s.get('model') or '-'}")
-        # In-session compression boundaries: compacted summary rows carry the wall-clock
-        # time at which that point of the transcript was compacted.
-        boundaries = {
-            row["id"]: row["timestamp"]
-            for row in db._read_all(
-                "SELECT id, timestamp FROM messages WHERE session_id = ? "
-                "AND _compressed_summary = 1 AND compacted = 1 ORDER BY id", (seg,))
-        }
+        bnds = data["segments"][i]["in_session_boundaries"]
         emitted = set()
         for e in data["segments"][i]["prompts"]:
-            for bid, ts in sorted(boundaries.items()):
-                if bid < e["row_id"] and bid not in emitted:
-                    emitted.add(bid)
-                    print(f"  ══ compression boundary @ {datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')} "
-                          f"├ context above this point was compacted; timestamps below prove ordering ══")
+            for b in bnds:
+                if b["row_id"] < e["row_id"] and b["row_id"] not in emitted:
+                    emitted.add(b["row_id"])
+                    ts = datetime.fromtimestamp(b["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                    print(f"  ══ in-session compression @ {ts}  "
+                          f"{b['goal'][:60] or '(no goal line)'} ══")
             ts2 = datetime.fromtimestamp(e["timestamp"]).strftime("%m-%d %H:%M:%S")
             print(f"  {ts2}  {e['preview'] or '(unpromptable)'}")
 

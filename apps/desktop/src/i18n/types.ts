@@ -2704,6 +2704,8 @@ export interface Translations {
       timelineEmpty: string
       timelineBoundary: (ts: string) => string
       timelineWindow: (start: string, end: string) => string
+      timelineInSessionComps?: (n: number) => string
+      timelineInSessionComp?: (ts: string, goal: string) => string
       branchFrom: string
       rename: string
       archive: string

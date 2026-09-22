@@ -641,6 +641,7 @@ async def get_session_timeline(
         data = {"session_id": sid, "profile": owner,
                 **read_timeline(db, sid, limit=limit, after_row_id=after_row_id)}
         if expand == "lineage":
+            from hermes_state_timeline import get_in_session_compressions
             chain = db.get_compression_lineage(sid) or [sid]
             segments = []
             for index, seg in enumerate(chain):
@@ -655,6 +656,7 @@ async def get_session_timeline(
                     "ended_at": sess.get("ended_at"), "end_reason": sess.get("end_reason"),
                     "last_in_segment_compaction": last_compaction,
                     "compacted": index > 0 or last_compaction is not None,
+                    "in_session_compressions": get_in_session_compressions(db, seg),
                 })
             # Per-segment prompt indexes (bounded: the module's own pagination cap).
             for i_seg, seg in enumerate(chain):

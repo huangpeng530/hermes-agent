@@ -129,6 +129,32 @@ export function SessionTimelineDialog({
                 <div className="text-xs text-muted-foreground">
                   {r.timelineWindow(formatTimestamp(segment.started_at), formatTimestamp(segment.ended_at))}
                 </div>
+                {(() => {
+                  const inPlace = segment.in_session_compressions ?? []
+                  if (inPlace.length === 0) {
+                    return null
+                  }
+                  return (
+                    <div className="space-y-0.5 rounded-md border border-border/60 bg-accent/40 p-2">
+                      <div className="flex items-center gap-1.5 text-xs font-medium">
+                        <Codicon name="history" size="0.875rem" />
+                        <span>{r.timelineInSessionComps(inPlace.length)}</span>
+                      </div>
+                      <ul className="mt-1 space-y-0.5">
+                        {inPlace.map(comp => (
+                          <li key={comp.row_id} className="flex gap-2 text-xs">
+                            <span className="shrink-0 tabular-nums text-muted-foreground">
+                              {r.timelineInSessionComp(
+                                formatTimestamp(comp.timestamp),
+                                comp.goal || '—'
+                              )}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )
+                })()}
                 <ul className="space-y-0.5">
                   {segment.prompts.map(prompt => (
                     <li key={prompt.row_id} className="flex gap-2 text-xs">

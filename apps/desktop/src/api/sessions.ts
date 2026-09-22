@@ -472,6 +472,17 @@ export interface SessionTimelinePrompt {
   timestamp: number
 }
 
+/** One in-place (in-session) compaction event: the pinned [CONTEXT COMPACTION]
+ *  summary marker, still inside a single session_id. `goal` is the leading
+ *  `## Goal` line of that marker — what the session was doing when it compacted.
+ *  Older backends that predate this field omit `in_session_compressions`. */
+export interface InSessionCompression {
+  row_id: number
+  timestamp: number
+  role: string
+  goal: string
+}
+
 /** One compression segment (a session row) with its prompt index. */
 export interface SessionTimelineSegment {
   session_id: string
@@ -483,6 +494,7 @@ export interface SessionTimelineSegment {
   end_reason: string | null
   last_in_segment_compaction: number | null
   compacted: boolean
+  in_session_compressions?: InSessionCompression[]
   prompts: SessionTimelinePrompt[]
 }
 

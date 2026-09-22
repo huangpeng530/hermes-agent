@@ -3185,6 +3185,8 @@ export const en: Translations = {
       timelineEmpty: 'No user prompts in this segment.',
       timelineBoundary: (ts: string) => `Compaction boundary @ ${ts}`,
       timelineWindow: (start: string, end: string) => `${start} → ${end}`,
+      timelineInSessionComps: (n: number) => `${n} in-place compression event${n !== 1 ? 's' : ''}`,
+      timelineInSessionComp: (ts: string, goal: string) => `@ ${ts} · ${goal}`,
       branchFrom: 'Branch',
       rename: 'Rename…',
       archive: 'Archive',

@@ -3054,6 +3054,8 @@ export const zh = defineLocale({
       timelineEmpty: '此压缩段没有用户指令。',
       timelineBoundary: (ts: string) => `压缩边界 @ ${ts}`,
       timelineWindow: (start: string, end: string) => `${start} → ${end}`,
+      timelineInSessionComps: (n: number) => `原地压缩事件 ×${n}`,
+      timelineInSessionComp: (ts: string, goal: string) => `${ts} · ${goal}`,
       branchFrom: '分支',
       rename: '重命名…',
       archive: '归档',
