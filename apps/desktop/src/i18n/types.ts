@@ -2697,6 +2697,15 @@ export interface Translations {
       unreadFailed: string
       copyId: string
       export: string
+      timeline: string
+      timelineTitle: (title: string) => string
+      timelineLoading: string
+      timelineNoSegments: string
+      timelineEmpty: string
+      timelineBoundary: (ts: string) => string
+      timelineWindow: (start: string, end: string) => string
+      timelineInSessionComps?: (n: number) => string
+      timelineInSessionComp?: (ts: string, goal: string) => string
       branchFrom: string
       rename: string
       archive: string

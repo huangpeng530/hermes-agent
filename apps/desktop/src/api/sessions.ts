@@ -465,6 +465,79 @@ export function getSessionMessages(
   })
 }
 
+/** One timeline prompt: preview text + the prompt's wall-clock timestamp. */
+export interface SessionTimelinePrompt {
+  row_id: number
+  preview: string
+  timestamp: number
+}
+
+/** One in-place (in-session) compaction event: the pinned [CONTEXT COMPACTION]
+ *  summary marker, still inside a single session_id. `goal` is the leading
+ *  `## Goal` line of that marker — what the session was doing when it compacted.
+ *  Older backends that predate this field omit `in_session_compressions`. */
+export interface InSessionCompression {
+  row_id: number
+  timestamp: number
+  role: string
+  goal: string
+}
+
+/** One compression segment (a session row) with its prompt index. */
+export interface SessionTimelineSegment {
+  session_id: string
+  title: string | null
+  source: string | null
+  model: string | null
+  started_at: number | null
+  ended_at: number | null
+  end_reason: string | null
+  last_in_segment_compaction: number | null
+  compacted: boolean
+  in_session_compressions?: InSessionCompression[]
+  prompts: SessionTimelinePrompt[]
+}
+
+/**
+ * The cross-compression timeline: the full prompt index of a session INCLUDING
+ * every compacted ancestor, segmented by compression boundary, each prompt with
+ * its wall-clock timestamp. This is the read-only source the Desktop timeline
+ * panel renders; older backends that predate `expand=lineage` still answer the
+ * base call (the extra fields are additive and simply absent).
+ */
+export interface SessionTimelineResponse {
+  session_id: string
+  profile: string
+  entries: SessionTimelinePrompt[]
+  lineage?: string[]
+  segments?: SessionTimelineSegment[]
+  pagination: {
+    limit: number
+    after_row_id: number
+    returned: number
+    total: number
+    has_more: boolean
+    next_cursor: number | null
+  }
+}
+
+export function getSessionTimeline(
+  id: string,
+  profile?: ProfileScope,
+  options: { limit?: number } = {}
+): Promise<SessionTimelineResponse> {
+  const scope = sessionScoped(profile)
+  const query = new URLSearchParams()
+  query.set('expand', 'lineage')
+  if (options.limit !== undefined) {
+    query.set('limit', String(options.limit))
+  }
+  return hermesApi<SessionTimelineResponse>({
+    ...scope,
+    path: `/api/sessions/${encodeURIComponent(id)}/timeline?${query.toString()}`
+  })
+}
+
 /**
  * The initial hydration page: enough tail to fill the transcript window a few
  * times over, small enough that opening a long session doesn't ship (and

@@ -164,3 +164,28 @@ def get_session_timeline(db, session_id, *, limit=500, after_row_id=0):
                        "total": total, "has_more": has_more,
                        "next_cursor": page[-1]["sort_id"] if has_more else None},
     }
+
+
+def get_in_session_compressions(db, session_id):
+    """In-place (in-session) compaction events, distinct from rotation-style lineage.
+
+    The agent's ContextCompressor pins a ``[CONTEXT COMPACTION]`` summary marker row
+    and flags it ``_compressed_summary = 1`` inside the SAME session_id (no
+    ``parent_session_id`` rotation). That is the dimension a lineage-only view is
+    blind to. ``_compressed_summary = 1`` is the exact marker (0 false positives in
+    the observed stores) and, unlike the ``compacted`` block, still catches the most
+    recent boundary, which may be ``active = 1``. Read-only; every event carries its
+    wall-clock timestamp. Each event's ``goal`` is the leading line of the marker's
+    ``## Goal`` block (human-readable label of what the session was doing)."""
+    rows = db._read_all(
+        "SELECT id, timestamp, role, content FROM messages "
+        "WHERE session_id = ? AND _compressed_summary = 1 ORDER BY id", (session_id,))
+    out = []
+    for r in rows:
+        goal = ""
+        m = re.search(r"## Goal\n(.*)", r["content"] or "", re.S)
+        if m:
+            goal = m.group(1).split("\n")[0].strip()
+        out.append({"row_id": r["id"], "timestamp": r["timestamp"],
+                    "role": r["role"], "goal": goal})
+    return out
