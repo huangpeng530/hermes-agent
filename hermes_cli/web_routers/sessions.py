@@ -620,11 +620,17 @@ def _timeline_session_id(db, session_id: str, owner: str) -> str:
 async def get_session_timeline(
     session_id: str, profile: Optional[str] = None,
     limit: int = Query(500, ge=1, le=500), after_row_id: int = Query(0, ge=0),
+    expand: str = Query("", pattern="(^$|lineage)"),
 ):
     """Prompt metadata only, including compacted display history (never rewind rows).
 
     ``next_cursor`` is a stable logical first-row id; pass it as ``after_row_id``.
     Entry ``row_id`` addresses the current representative for /messages/around.
+
+    ``expand=lineage`` adds the cross-compression view (the Desktop timeline panel's
+    payload): the compression chain root -> tip, each segment's metadata, and where each
+    segment was compacted (its last in-segment compaction timestamp). Purely additive —
+    the base fields above are unchanged and older clients ignore the extras.
     """
     from hermes_state_timeline import get_session_timeline as read_timeline
 
@@ -632,8 +638,38 @@ async def get_session_timeline(
 
     def _read(db):
         sid = _timeline_session_id(db, session_id, owner)
-        return {"session_id": sid, "profile": owner,
+        data = {"session_id": sid, "profile": owner,
                 **read_timeline(db, sid, limit=limit, after_row_id=after_row_id)}
+        if expand == "lineage":
+            chain = db.get_compression_lineage(sid) or [sid]
+            segments = []
+            for index, seg in enumerate(chain):
+                sess = db.get_session(seg) or {}
+                row = db._read_one(
+                    "SELECT MAX(timestamp) FROM messages WHERE session_id = ? "
+                    "AND _compressed_summary = 1 AND compacted = 1", (seg,))
+                last_compaction = row[0] if row else None
+                segments.append({
+                    "session_id": seg, "title": sess.get("title"), "source": sess.get("source"),
+                    "model": sess.get("model"), "started_at": sess.get("started_at"),
+                    "ended_at": sess.get("ended_at"), "end_reason": sess.get("end_reason"),
+                    "last_in_segment_compaction": last_compaction,
+                    "compacted": index > 0 or last_compaction is not None,
+                })
+            # Per-segment prompt indexes (bounded: the module's own pagination cap).
+            for i_seg, seg in enumerate(chain):
+                entries: list = []
+                cursor = 0
+                while True:
+                    page = read_timeline(db, seg, limit=500, after_row_id=cursor)
+                    entries.extend(page["entries"])
+                    if not page["pagination"]["has_more"]:
+                        break
+                    cursor = page["pagination"]["next_cursor"]
+                segments[i_seg]["prompts"] = entries
+            data["lineage"] = chain
+            data["segments"] = segments
+        return data
 
     return await asyncio.to_thread(_with_db, profile, _read, read_only=True)
 

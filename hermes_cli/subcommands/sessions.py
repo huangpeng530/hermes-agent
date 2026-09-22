@@ -249,6 +249,15 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
+    sessions_timeline = sessions_subparsers.add_parser(
+        "timeline", help="Cross-compression prompt timeline (prompts + wall-clock timestamps)")
+    sessions_timeline.add_argument("session_id", help="Session ID or unique prefix")
+    sessions_timeline.add_argument("--limit", type=int, default=200,
+        help="Max prompts to show in the tip segment (default: 200)")
+    sessions_timeline.add_argument("--segments", action="store_true",
+        help="Compact view: only the compression segment chain and boundary times, no prompts")
+    _flag(sessions_timeline, "--json", help="Machine-readable JSON (lineage + all prompts + timestamps)")
+
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title")
     sessions_rename.add_argument("session_id", help="Session ID to rename")
