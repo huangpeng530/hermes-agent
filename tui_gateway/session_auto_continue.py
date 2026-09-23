@@ -52,19 +52,38 @@ def _reasoning_stall_auto_continue_config() -> tuple[bool, int]:
     return enabled, max_attempts
 
 
-def _reasoning_stall_note() -> str:
+def _reasoning_stall_note(original: str | None = None) -> str:
     """Continuation nudge re-submitted after a reasoning-only stall.
 
     Reuses the crash-continue note opener so transcript tooling classifies it as an
     ``auto_continue`` row. Unlike the crash path the app is still up, the whole transcript is
     intact and the ORIGINAL task is already in context — so this is a plain "keep going" nudge,
     not a resubmission of the user's message.
+
+    ``original`` (the last real human prompt, see ``_last_user_prompt_text``) is appended as an
+    anchor when available: a background machine turn (bg-review, process_complete) can own the
+    slot and pollute the live context, so without the anchor the model may continue the WRONG
+    task — e.g. treat a skill-library review as the current work and clean-stop it, stranding
+    the real task (the 2026-09-23 19:34 incident). When ``original`` is empty the note is
+    byte-identical to the pre-anchor form (no behavior change for sessions with no human task).
     """
-    return (
+    base = (
         f"{_AUTO_CONTINUE_NOTE_PREFIX} — the previous turn ended mid-thinking: the model stopped "
         "after a planning monologue without executing its next step, so the task is NOT done. "
         "Review the current state (last tool results in the history) and CONTINUE from the first "
         "step that has no recorded result — do NOT re-run steps whose results already exist."
+    )
+    original = (original or "").strip()
+    if not original:
+        return base
+    # Truncate a runaway prompt: the anchor must never bloat the nudge (a full image/history
+    # payload would defeat the cache-stable note the classifier matches on its prefix).
+    original = original[:500]
+    return (
+        base
+        + " The user's current task was:\n"
+        + original
+        + "\nContinue THAT task; ignore any background/auxiliary work that was interleaved."
     )
 
 
@@ -306,10 +325,10 @@ def _maybe_schedule_reasoning_stall_auto_continue(rid, sid: str, session: dict, 
             "count=%d); the promoted planning text stands and the user nudges manually.",
             key, enabled, max_attempts, count)
         return
-    note = _reasoning_stall_note()
-    # Same crash hand-off as the transient path: if this continuation later dies in a PROCESS
-    # crash, the resume-time crash marker re-submits the ORIGINAL user task, not this nudge.
     original = _last_user_prompt_text(result)
+    note = _reasoning_stall_note(original)
+    # Crash hand-off: if this continuation later dies in a PROCESS crash, the resume-time crash
+    # marker re-submits the ORIGINAL user task, not this nudge.
     with _session_turn_admission(session) as admitted:
         if not admitted:
             logger.info("reasoning-stall auto-continue NOT scheduled for session %s: the backend "

@@ -81,6 +81,34 @@ def test_stall_note_uses_continue_wording_and_prefix():
     assert "do NOT re-run steps" in note
 
 
+def test_stall_note_with_original_task_appends_anchor():
+    # 2026-09-23 19:34: a bg-review turn polluted the live context, so the generic note let the
+    # model continue the WRONG task (skill review) and clean-stop it. Carrying the original human
+    # prompt in the note pins the continuation to the real task.
+    note = server._reasoning_stall_note("keep fixing the GTA5 mod")
+    assert note.startswith(_AUTO_CONTINUE_NOTE_PREFIX)
+    assert "The user's current task was:" in note
+    assert "keep fixing the GTA5 mod" in note
+    assert "ignore any background/auxiliary work" in note
+    # the generic base wording is still present (anchor is appended, not a replacement)
+    assert "CONTINUE from the first" in note
+
+
+def test_stall_note_without_original_is_byte_identical():
+    # No human task in history (image-only / no history yet): byte-identical to the pre-anchor
+    # form, so those sessions' behavior is unchanged.
+    assert server._reasoning_stall_note() == server._reasoning_stall_note(None)
+    assert "The user's current task was:" not in server._reasoning_stall_note("   ")
+
+
+def test_stall_note_truncates_runaway_original():
+    long = "x" * 5000
+    note = server._reasoning_stall_note(long)
+    # the 500-char cap keeps the anchor from bloating the cache-stable nudge
+    assert len(note) < len("x" * 5000)
+    assert "The user's current task was:" in note
+
+
 # ── config reader ──────────────────────────────────────────────────────
 
 def test_stall_config_reader_defaults(monkeypatch):
