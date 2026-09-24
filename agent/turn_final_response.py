@@ -106,11 +106,26 @@ def finish_text_response(
             _turn_tool_calls = sum(
                 1 for _m in messages[_last_user + 1:]
                 if isinstance(_m, dict) and _m.get("role") == "assistant" and _m.get("tool_calls"))
+            # P3 exception (mid-chain steering): a user row whose immediate predecessor is a tool
+            # result was injected MID-tool-chain — a steer/redirect into an in-progress task, never
+            # a fresh standalone question (a completed turn always ends on an assistant final-answer
+            # row before the next user message, so "user right after a tool" can only be a mid-turn
+            # injection). On such a row a 0-tool reasoning-only clean stop strands the task the steer
+            # was driving even though THIS turn made no tool calls of its own, so it is a stall, not
+            # a Q&A answer. Purely structural: the content tail (already, or not, tripping the in-loop
+            # guard) is a separate matter; the scheduler's attempt budget bounds the re-queue either
+            # way, so the only false positive is a bounded one-call cost.
+            _steer_mid_chain = (
+                _last_user > 0
+                and isinstance(messages[_last_user - 1], dict)
+                and messages[_last_user - 1].get("role") == "tool"
+            )
             # Machine-readable stall marker for live-process surfaces (desktop/gateway
-            # auto-continue): a reasoning-only clean stop AFTER real tool work this turn is a
-            # stalled in-progress task, not a legitimate answer. The finalizer stamps it into
-            # the result dict so those surfaces can re-queue one continuation.
-            agent._reasoning_only_stall = _turn_tool_calls > 0
+            # auto-continue): a reasoning-only clean stop AFTER real tool work this turn, OR on a
+            # mid-tool-chain steering row, is a stalled in-progress task, not a legitimate answer.
+            # The finalizer stamps it into the result dict so those surfaces can re-queue one
+            # continuation (budget-bounded by the reasoning-stall auto-continue config).
+            agent._reasoning_only_stall = _turn_tool_calls > 0 or _steer_mid_chain
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
             # (planning monologue, zero tool calls) while the turn reports "complete".
             logger.warning(

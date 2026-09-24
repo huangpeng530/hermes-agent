@@ -117,3 +117,39 @@ def test_stall_flag_reset_between_candidates(loop_agent):
     verdict = _call_finish(loop_agent, _assistant_msg("done, no stall here", None), messages)
     assert loop_agent._reasoning_only_stall is False
     assert verdict.action in ("return", "break", "continue")
+
+
+def test_stall_flag_set_on_mid_chain_steer_no_tools_this_turn(loop_agent):
+    # P3: the 2026-09-24 15:40 incident. A steer / mid-turn user row lands RIGHT AFTER a tool
+    # result (immediate predecessor is a tool row), and THIS turn makes 0 tool calls before a
+    # reasoning-only clean stop. The old rule saw 0 tools-after-last-user and treated it as a
+    # normal Q&A answer (no stall, no auto-continue) — stranding the task the steer was driving.
+    # A user row whose predecessor is a tool row can only be a mid-chain injection (a completed
+    # turn always ends on an assistant answer row before the next user message), so it IS a stall.
+    tool_calls = [SimpleNamespace(id="c1", type="function",
+                                   function=SimpleNamespace(name="terminal", arguments="{}"))]
+    messages = [
+        {"role": "user", "content": "do the task"},
+        {"role": "assistant", "content": "", "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": "c1", "content": "step result"},
+        {"role": "user", "content": "你自主决定"},   # mid-chain steer = the LAST user row
+    ]
+    _call_finish(loop_agent, _assistant_msg("", REASONING), messages)
+    assert loop_agent._reasoning_only_stall is True
+
+
+def test_stall_flag_clear_when_user_after_completed_answer(loop_agent):
+    # P3 counter-example guard: a fresh user message that arrives AFTER a completed assistant
+    # answer row (not right after a tool row) is a standalone question, not a mid-chain steer.
+    # 0 tools this turn + reasoning-only stop on such a row is a legitimate Q&A answer -> no stall.
+    tool_calls = [SimpleNamespace(id="c1", type="function",
+                                   function=SimpleNamespace(name="terminal", arguments="{}"))]
+    messages = [
+        {"role": "user", "content": "do the task"},
+        {"role": "assistant", "content": "", "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": "c1", "content": "step result"},
+        {"role": "assistant", "content": "done, here is the answer"},   # completed turn
+        {"role": "user", "content": "what is the answer to 2+2?"},     # fresh question, last row
+    ]
+    _call_finish(loop_agent, _assistant_msg("", REASONING), messages)
+    assert loop_agent._reasoning_only_stall is False
