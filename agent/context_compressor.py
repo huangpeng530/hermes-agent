@@ -823,6 +823,105 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
 _SUMMARY_INPUT_MAX_CHARS = 160_000
 
+# Regex for the "User asked: '<verbatim quote>'" phrasing the compaction
+# template pushes the LLM into. Compaction models occasionally fabricate a
+# quote to fit the template even when no such user message exists in the
+# compacted turns (issue #62365). The post-validation helper below strips
+# any such line that cannot be located in the source turns — the safe
+# fallback is "None — no verifiable outstanding user request".
+_USER_ASKED_QUOTE_RE = re.compile(
+    r"""User\s+asked:\s*['"\u2018\u2019\u201c\u201d]([^'"\u2018\u2019\u201c\u201d]{1,500}?)['"\u2018\u2019\u201c\u201d]""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    """Normalize text for the fabricated-quote check.
+
+    Substring matches are intentionally loose — the LLM may quote with
+    light whitespace/quote-mark drift, and a 5-token user message is
+    short enough that exact match is brittle. We:
+      - lowercase
+      - collapse internal whitespace
+      - strip surrounding whitespace
+    """
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _serialize_user_turn_text(turns: List[Dict[str, Any]]) -> str:
+    """Concatenate user-role text from ``turns`` for quote provenance.
+
+    ``User asked:`` claims must be proven by actual user input only
+    (#62365). Assistant content and tool-call arguments are model-authored
+    and must never validate a claim labeled as a user request.
+    """
+    out: List[str] = []
+    for msg in turns or []:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    txt = part.get("text")
+                    if isinstance(txt, str):
+                        out.append(txt)
+        elif isinstance(content, str):
+            out.append(content)
+    return "\n".join(out)
+
+
+def _strip_fabricated_user_asks(
+    summary: str,
+    source_turns: List[Dict[str, Any]],
+    *,
+    prior_summary: Optional[str] = None,
+) -> str:
+    """Strip ``User asked: '<quote>'`` lines whose quote is unverifiable.
+
+    Issue #62365: the compaction template pushes the LLM to write
+    ``User asked: '<verbatim exact words>'``. When the actual conversation
+    has no such outstanding user request (or the LLM can't locate one),
+    it fabricates a quote to fit the template — the agent then acts on
+    a request that was never made.
+
+    Fix: after the LLM produces a summary, scan every ``User asked:``
+    line and check whether the quoted substring appears in user-role
+    source turns (case-insensitive, whitespace-normalized). On iterative
+    compaction the previously validated summary is also accepted as
+    provenance so a legitimate prior active task is not rewritten to
+    ``none`` when only new turns are re-summarized.
+
+    The fallback is the existing convention from the template's "if no
+    outstanding task exists, write 'None.'" guidance, so the shape of
+    downstream behavior does not change for legitimate ``None`` cases.
+    """
+    if not summary:
+        return summary
+    corpus_parts = [_serialize_user_turn_text(source_turns)]
+    if prior_summary:
+        corpus_parts.append(prior_summary)
+    source_norm = _normalize_for_quote_match("\n".join(part for part in corpus_parts if part))
+
+    def _replace(match: "re.Match[str]") -> str:
+        quote = _normalize_for_quote_match(match.group(1))
+        if not quote or len(quote) < 4:
+            return match.group(0)
+        if source_norm and quote in source_norm:
+            return match.group(0)
+        logger.warning(
+            "Compaction summary contained a fabricated 'User asked: \"…\"' "
+            "line that cannot be located in user-role source turns "
+            "(quote_len=%d, preview=%r). Replacing with safe fallback to "
+            "prevent the agent from acting on a request that was never made "
+            "(#62365).",
+            len(quote),
+            quote[:60],
+        )
+        return "User asked: (none — no verifiable outstanding user request in compacted turns)"
+
+    return _USER_ASKED_QUOTE_RE.sub(_replace, summary)
+
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 
@@ -1969,6 +2068,18 @@ back, never mind, just verify, change of topic) that supersedes earlier
 work, write the reverse signal verbatim and DO NOT carry forward the
 cancelled task. Example: "User asked: '<exact reverse signal>' — earlier
 in-flight work is cancelled."
+FABRICATION PREVENTION (CRITICAL):
+- DO NOT INVENT user requests. If the only "user input" you can find in the
+  turns is the system prompt or a tool result, write "None." — not a
+  paraphrase of tool output framed as a user request.
+- Quote text ONLY if it appears as a user-role message in the compacted
+  turns. Tool-result echoes, assistant suggestions, or paraphrases of
+  earlier conversation are NOT user requests.
+- The previous compaction summary is REFERENCE material — do not invent
+  new requests based on its content.
+- "User asked:" must be followed by text the user actually typed, not by
+  what an assistant said the user might want.
+If in doubt, write "None." and continue with the other sections.
 If no outstanding task exists, write "None."]""",
         "goal": "[What the user is trying to accomplish overall]",
         "constraints": (
@@ -3879,6 +3990,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
+            # Issue #62365: the compaction template pushes the LLM to write
+            # ``User asked: '<verbatim quote>'``. When the model can't locate
+            # a real outstanding ask it fabricates one to fit the template,
+            # and the agent then acts on a request that was never made.
+            # Validate against user-role source turns, plus the previously
+            # validated handoff on iterative compaction so a legitimate prior
+            # active task is not rewritten to "none" when only new turns are
+            # in turns_to_summarize.
+            summary = _strip_fabricated_user_asks(
+                summary,
+                turns_to_summarize,
+                prior_summary=self._previous_summary,
+            )
             self._validate_summary_user_provenance(summary, has_user_turn)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
             # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
