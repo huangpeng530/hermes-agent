@@ -506,6 +506,32 @@ def apply_llm_output_transform(
     return final_response, transformed, pre_transform
 
 
+def _background_review_gate(agent, result: dict, final_response, interrupted: bool,
+    _should_review_memory: bool, _should_review_skills: bool) -> str | None:
+    """Suppression reason for the automatic post-turn background review; None = spawn it.
+
+    A reasoning-only stall (#stall-continue-contention, 2026-09-23) suppresses the fork:
+    the turn "completed" with a truncated planning monologue mid-task, so a
+    reasoning-stall auto-continue is OWED at this very idle boundary. Spawning the
+    review fork here makes it fight the continuation for the session slot — the fork
+    gets hard-superseded mid-API-call (wasting a provider call and logging a scary
+    stream-drop warning) or its interleaved context pollutes the continuation's view.
+    The review is NOT lost: the idle queue re-triggers it after the continuation and
+    the task genuinely finish.
+    """
+    if not final_response:
+        return "no_response"
+    if interrupted:
+        return "interrupted"
+    if result.get("reasoning_only_stall"):
+        return "reasoning_stall_owed"
+    if getattr(agent, "skip_background_review", False):
+        return "skip_background_review"
+    if not (_should_review_memory or _should_review_skills):
+        return "no_review_target"
+    return None
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -699,6 +725,15 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Machine-readable stall flag set by the reasoning-only clean-stop path
+    # (agent/turn_final_response.py): the turn ENDED "complete" but its visible answer is a
+    # truncated planning monologue after real tool work — an in-progress task that stopped
+    # mid-plan, not a finished reply. Live-process surfaces (desktop / gateway
+    # auto-continue) read this to re-queue one continuation turn. Consumed + reset here so a
+    # stale flag never leaks into the next turn's result.
+    if getattr(agent, "_reasoning_only_stall", False):
+        result["reasoning_only_stall"] = True
+        agent._reasoning_only_stall = False
     # Persistence failures already set failed=True; also stamp `error` so the gateway
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
@@ -750,12 +785,13 @@ def finalize_turn(
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
-    if (
-        final_response
-        and not interrupted
-        and not getattr(agent, "skip_background_review", False)
-        and (_should_review_memory or _should_review_skills)
-    ):
+    # ALSO suppressed on a reasoning-only stall (#stall-continue-contention, 2026-09-23):
+    # the turn "completed" with a truncated planning monologue mid-task, so a
+    # reasoning-stall auto-continue is OWED at this exact idle boundary — the review
+    # fork would fight it for the slot. The review is NOT lost: the idle queue
+    # re-triggers it after the continuation (and the task) genuinely finishes.
+    if _background_review_gate(agent, result, final_response, interrupted,
+        _should_review_memory, _should_review_skills) is None:
         with suppress(Exception):
             agent._spawn_background_review(
                 messages_snapshot=list(messages), review_memory=_should_review_memory,
