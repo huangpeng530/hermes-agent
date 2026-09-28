@@ -40,6 +40,7 @@ import {
   projectIdForCwd,
   projectRootCwd
 } from '@/store/projects'
+import { SessionTimelineDialog } from './session-timeline-dialog'
 import {
   $activeSessionId,
   $connection,
@@ -219,6 +220,7 @@ function useSessionActions({
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
+  const [timelineOpen, setTimelineOpen] = useState(false)
   // The rename item opens a Dialog. When a menu closes, Radix restores focus to
   // its trigger — for a sidebar row that trigger is the row's own <button>, so
   // focus lands there instead of the dialog's input: Space then activates the
@@ -379,6 +381,16 @@ function useSessionActions({
       onSelect: () => {
         triggerHaptic('selection')
         void exportSession(sessionId, { profile, title })
+      }
+    }),
+    spec({
+      disabled: !sessionId,
+      icon: 'history',
+      label: r.timeline,
+      onSelect: () => {
+        triggerHaptic('selection')
+        suppressCloseFocusRef.current = true
+        setTimelineOpen(true)
       }
     })
   ]
@@ -580,7 +592,17 @@ function useSessionActions({
     />
   )
 
-  return { deleteDialog, onCloseAutoFocus, renameDialog, renderItems }
+  const timelineDialog = (
+    <SessionTimelineDialog
+      open={timelineOpen}
+      onOpenChange={setTimelineOpen}
+      profile={profile}
+      sessionId={sessionId}
+      title={title}
+    />
+  )
+
+  return { deleteDialog, onCloseAutoFocus, renameDialog, renderItems, timelineDialog }
 }
 
 interface DeleteSessionDialogProps {
@@ -621,7 +643,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
+  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems, timelineDialog } = useSessionActions(actions)
 
   return (
     <>
@@ -637,6 +659,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
       </ActionsMenu>
       {renameDialog}
       {deleteDialog}
+      {timelineDialog}
     </>
   )
 }
@@ -647,7 +670,7 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
+  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems, timelineDialog } = useSessionActions(actions)
 
   return (
     <>
@@ -661,6 +684,7 @@ export function SessionContextMenu({ children, ...actions }: SessionContextMenuP
       </ActionsContextMenu>
       {renameDialog}
       {deleteDialog}
+      {timelineDialog}
     </>
   )
 }
