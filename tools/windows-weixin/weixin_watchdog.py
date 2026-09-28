@@ -12,6 +12,10 @@ Run by scheduled task \\Hermes_WeixinWatchdog every ~10 min. A single tick:
        or "Reconnect weixin: no bot credential ... removing from retry queue"
        => the gateway permanently gave up on weixin -> restart it.
      - "weixin connected" since last tick -> reset the failure counter.
+  2b. Probe the live process table (psutil, exact-argv match):
+     - the messaging gateway process is NOT running (a cleanly-stopped gateway
+       writes no new log lines and trips neither trigger above, so the bot sat
+       dark for ~24 h on 2026-09-28) -> restart it.
   3. Throttle & escalation (state in watchdog.state.json):
      - at most 1 gateway restart per 5 min,
      - after 4 consecutive failing restarts without a fresh "weixin connected",
@@ -27,6 +31,7 @@ import os
 import re
 import subprocess
 import time
+
 
 def _hermes_home():
     """Locate HERMES_HOME.
@@ -155,6 +160,55 @@ def read_new_log(st):
         return []
 
 
+def _is_messaging_gateway(tokens):
+    """True only if this argv is the long-running MESSAGING gateway
+    (`... gateway run`).
+
+    Never the desktop headless backend (`hermes_cli.main serve ...`) and never
+    a transient `hermes gateway status|restart|stop` CLI call. The signature
+    is the adjacent `gateway` + `run` token pair, confirmed to belong to hermes
+    (a `hermes_cli.main` module in argv, or a hermes-named executable in the
+    first two tokens). We match the exact token pair, never a bare argv
+    substring (argv-substring process inference is the bug class behind the
+    fleet-update incidents; see root AGENTS.md)."""
+    for k in range(len(tokens) - 1):
+        if tokens[k] == "gateway" and tokens[k + 1] == "run":
+            is_hermes = (
+                any(t == "hermes_cli.main" for t in tokens)
+                or any("hermes" in t.lower() for t in tokens[:2])
+            )
+            if is_hermes:
+                return True
+    return False
+
+
+def gateway_process_alive():
+    """True if a messaging-gateway process is currently running.
+
+    The watchdog historically acted only on (1) a broken venv and (2) a
+    give-up line in agent.log. A CLEANLY-STOPPED gateway (e.g. an out-of-band
+    sync restart whose start half never came up) writes no new log lines and
+    trips neither trigger, so the bot sat dark ~24 h on 2026-09-28. This third
+    trigger probes the live process table instead.
+
+    Uses psutil (present in the venv) + exact-argv subcommand matching. On a
+    psutil import/scan failure we fail CLOSED (return True = assume alive) so a
+    transient process-table hiccup can never cause a needless restart."""
+    try:
+        import psutil
+    except Exception:
+        log("psutil unavailable; assuming gateway alive (fail-closed)")
+        return True
+    for p in psutil.process_iter(["cmdline"]):
+        try:
+            toks = [t for t in (p.info.get("cmdline") or []) if t]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if toks and _is_messaging_gateway(toks):
+            return True
+    return False
+
+
 NO_RESTART = False  # set in __main__ when --no-restart passed
 
 def main():
@@ -204,6 +258,21 @@ def main():
                 log("restart issued; expecting reconnect within next ticks")
         else:
             log("restart throttled; next tick will restart")
+            st["consec_fail"] += 1
+
+    # ---- 2b. live-process detection (a cleanly-stopped gateway) ----
+    if not gateway_process_alive():
+        log("messaging gateway process not found -> restarting")
+        if can_restart(st, now):
+            ok = restart_gateway()
+            st["last_restart_ts"] = now
+            st["consec_fail"] += 1
+            if not ok:
+                exit_code = 2
+            else:
+                log("restart issued for missing gateway; expecting it up within next ticks")
+        else:
+            log("gateway missing but restart throttled (cooldown); next tick will restart")
             st["consec_fail"] += 1
 
     save_state(st)
