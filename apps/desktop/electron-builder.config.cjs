@@ -137,7 +137,10 @@ module.exports = {
     }
   ],
   asar: {
-    unpack: ['**/*.node', '**/prebuilds/**', 'dist/**']
+    // assets/** unpacked: the tray customization reads
+    // resources/app.asar.unpacked/assets/icon-tray.png at runtime in
+    // packaged mode — keep it outside the asar or the tray icon is lost.
+    unpack: ['**/*.node', '**/prebuilds/**', 'dist/**', 'assets/**']
   },
   mac: {
     // The afterSign hook owns notarization, including keychain-profile builds.
