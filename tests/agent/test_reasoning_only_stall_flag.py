@@ -75,6 +75,7 @@ def _call_finish(agent, assistant_message, messages):
         length_continue_retries=0,
         _pending_verification_response=None,
         _pending_verification_response_previewed=None,
+        effective_task_id="task-1",
     )
 
 
