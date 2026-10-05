@@ -1,0 +1,15 @@
+ ' weixin watchdog launcher - scheduled task \\Hermes_WeixinWatchdog (hidden)
+' WScript (//B //Nologo) + cmd window style 0: fully invisible, no console flash.
+' The launcher bat handles the actual run + stdout redirect to watchdog.stdout.log.
+Option Explicit
+Dim sh, env
+Set sh = CreateObject("WScript.Shell")
+Set env = sh.Environment("PROCESS")
+env.Item("HERMES_HOME") = "%HERMES_HOME%"
+If Len(env.Item("PYTHONPATH")) > 0 Then
+  env.Item("PYTHONPATH") = "%PYTHONPATH%"
+Else
+  env.Item("PYTHONPATH") = ""
+End If
+sh.CurrentDirectory = "%HERMES_HOME%"
+sh.Run "cmd.exe /c ""%BAT_PATH%""", 0, False
