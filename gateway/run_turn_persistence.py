@@ -116,6 +116,12 @@ class GatewayTurnPersistenceMixin:
         # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
             await self._clear_restart_failure_count(session_key)
+            self._transient_autocontinue_budget().pop(session_key, None)
+            # A reasoning-stall turn also reports "complete" (its answer is the promoted
+            # planning text), so it must NOT clear its own stall budget or the breaker could
+            # never trip; only a genuine non-stall completion resets it.
+            if not agent_result.get("reasoning_only_stall"):
+                self._reasoning_stall_autocontinue_budget().pop(session_key, None)
             try:
                 await self.async_session_store.clear_resume_pending(session_key)
             except Exception as _e:
