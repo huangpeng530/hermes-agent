@@ -55,7 +55,7 @@ def _assistant_msg(content, reasoning_content, tool_calls=None):
     return SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=reasoning_content)
 
 
-def _call_finish(agent, assistant_message, messages):
+def _call_finish(agent, assistant_message, messages, conversation_history=None):
     return finish_text_response(
         agent,
         assistant_message=assistant_message,
@@ -63,7 +63,7 @@ def _call_finish(agent, assistant_message, messages):
         finish_reason="stop",
         messages=messages,
         api_messages=list(messages),
-        conversation_history=[],
+        conversation_history=list(conversation_history or []),
         api_call_count=1,
         user_message="continue the task",
         active_system_prompt="You are helpful.",
@@ -118,3 +118,53 @@ def test_stall_flag_reset_between_candidates(loop_agent):
     verdict = _call_finish(loop_agent, _assistant_msg("done, no stall here", None), messages)
     assert loop_agent._reasoning_only_stall is False
     assert verdict.action in ("return", "break", "continue")
+
+
+def _deep_history(n):
+    # A session that has already accumulated n conversation messages (the task ran many
+    # turns before this final reasoning-only stop).
+    return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"step {i}"} for i in range(n)]
+
+
+def test_stall_flag_set_when_reasoning_only_stop_in_deep_session(loop_agent):
+    # P4: a fresh task prompt into a DEEP session, zero tool calls this turn, empty visible
+    # answer, reasoning-only clean stop -> the long task has derailed; flag it so the
+    # live-process scheduler re-prompts once. (The 2026-10-08 17:13 incident: 6056-msg
+    # session, "检查并升级hermes", model stopped mid-rebuild-mono on a 0-tool empty stop.)
+    messages = [{"role": "user", "content": "检查并升级hermes"}]
+    _call_finish(
+        loop_agent, _assistant_msg("", REASONING), messages,
+        conversation_history=_deep_history(30),
+    )
+    assert loop_agent._reasoning_only_stall is True
+
+
+def test_stall_flag_clear_when_reasoning_only_stop_in_shallow_session(loop_agent):
+    # Preserved exemption: a shallow session (few messages) with a reasoning-only, 0-tool
+    # clean stop is still a legitimate in-head Q&A -> NOT a stall.
+    messages = [{"role": "user", "content": "what is the answer?"}]
+    _call_finish(loop_agent, _assistant_msg("", REASONING), messages)
+    assert loop_agent._reasoning_only_stall is False
+
+
+def test_stall_flag_depth_boundary(loop_agent):
+    # Just below the 20-message threshold stays a Q&A exemption; at/above it is a stall.
+    messages = [{"role": "user", "content": "go"}]
+    _call_finish(
+        loop_agent, _assistant_msg("", REASONING), messages,
+        conversation_history=_deep_history(19),
+    )
+    assert loop_agent._reasoning_only_stall is False
+    _call_finish(
+        loop_agent, _assistant_msg("", REASONING), messages,
+        conversation_history=_deep_history(20),
+    )
+    assert loop_agent._reasoning_only_stall is True
+
+
+def test_stall_flag_set_when_reasoning_only_stop_in_deep_session_with_no_history_param(loop_agent):
+    # conversation_history is the authoritative depth source; `messages` alone does NOT
+    # extend it. A single-user `messages` with an empty history stays a Q&A exemption.
+    messages = [{"role": "user", "content": "go"}]
+    _call_finish(loop_agent, _assistant_msg("", REASONING), messages, conversation_history=[])
+    assert loop_agent._reasoning_only_stall is False

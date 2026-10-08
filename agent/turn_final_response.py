@@ -31,6 +31,29 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_dropped_toolcall_nudge",
 )
 
+# P4 (2026-10-08): a reasoning-only clean stop that is a STALLED LONG TASK (not a fresh Q&A)
+# once the session has accumulated >= this many conversation messages. The model did real work
+# over many turns, then derails into "thinking" with no visible answer and no tool call. Bounded
+# downstream by the live-process reasoning-stall auto-continue budgets, so at most one wasted
+# continuation fires on a genuinely-complete reasoning-only answer.
+_DEEP_SESSION_REASONING_ONLY_STALL_MIN_MESSAGES = 20
+
+
+def _deep_session_reasoning_only_stall(promoted, conversation_history) -> bool:
+    """True when a DEEP session (>= ``_DEEP_SESSION_REASONING_ONLY_STALL_MIN_MESSAGES``
+    conversation messages) stops on an empty-visible, reasoning-only clean stop.
+
+    After a long task the model can derail into a planning monologue that never becomes a
+    visible answer and never issues a tool call; the turn still reports ``complete``. Flagging
+    it lets the live-process reasoning-stall scheduler re-prompt once (bounded per-session),
+    instead of parking the task. A shallow session (few messages) with a reasoning-only answer
+    is still a legitimate in-head Q&A, so the flag stays False there unless the turn did tool
+    work — the tool-work leg is evaluated by the caller."""
+    if not promoted:
+        return False
+    depth = len(conversation_history) if isinstance(conversation_history, (list, tuple)) else 0
+    return depth >= _DEEP_SESSION_REASONING_ONLY_STALL_MIN_MESSAGES
+
 
 @dataclass
 class FinalResponseVerdict:
@@ -128,16 +151,23 @@ def finish_text_response(
                 1 for _m in messages[_last_user + 1:]
                 if isinstance(_m, dict) and _m.get("role") == "assistant" and _m.get("tool_calls"))
             # Machine-readable stall marker for live-process surfaces (desktop/gateway
-            # auto-continue): a reasoning-only clean stop AFTER real tool work this turn is a
-            # stalled in-progress task, not a legitimate answer. The finalizer stamps it into
-            # the result dict so those surfaces can re-queue one continuation.
-            agent._reasoning_only_stall = _turn_tool_calls > 0
+            # auto-continue): a reasoning-only clean stop is a stalled task, not a
+            # legitimate answer, when it happens (a) AFTER real tool work this turn, or
+            # (b) in a DEEP session where a long task has derailed into an in-head
+            # monologue that never becomes a visible answer (P4). Shallow sessions keep
+            # the "model answered in thinking" Q&A exemption. The finalizer stamps it
+            # into the result dict so those surfaces can re-queue one continuation.
+            _deep_stall = _deep_session_reasoning_only_stall(_promoted, conversation_history)
+            agent._reasoning_only_stall = _turn_tool_calls > 0 or _deep_stall
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
             # (planning monologue, zero tool calls) while the turn reports "complete".
             logger.warning(
                 "Reasoning-only clean stop (%d chars) — returning the reasoning as the final "
-                "response (model=%s provider=%s api_calls=%d tool_turns=%d)",
-                len(_promoted), agent.model, agent.provider, api_call_count, _turn_tool_calls,
+                "response (model=%s provider=%s api_calls=%d tool_turns=%d session_msgs=%d "
+                "deep_stall=%s)",
+                len(_promoted), agent.model, agent.provider, api_call_count,
+                _turn_tool_calls, len(conversation_history) if isinstance(
+                    conversation_history, (list, tuple)) else 0, _deep_stall,
             )
     final_response = _promoted or assistant_message.content or ""
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
