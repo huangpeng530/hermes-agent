@@ -26,26 +26,33 @@ from agent.turn_final_response import finish_text_response
 def loop_agent():
     from run_agent import AIAgent
     from unittest.mock import MagicMock, patch
-    with (
-        patch("model_tools.get_tool_definitions", return_value=[]),
-        patch("model_tools.check_toolset_requirements", return_value={}),
-        patch("agent.process_bootstrap.OpenAI"),
-    ):
-        agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://api.deepseek.com/v1",
-            model="deepseek-reasoner",
-            provider="deepseek",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.client = MagicMock()
-        agent._cached_system_prompt = "You are helpful."
-        agent._use_prompt_caching = False
-        agent.compression_enabled = False
-        agent.save_trajectories = False
-        return agent
+    # P4's reasoning-only stall marker rides the reasoning-promotion path, which upstream
+    # (38880bd) gates behind `answer_in_reasoning_capability` (non-trusted routes keep
+    # reasoning private and take the continuation ladder instead of promoting). Hold the gate
+    # open ACROSS the whole test body (yield inside the patch) so the P4 stall leg is
+    # reachable: the construction-time patches below can drop at construction, but this one
+    # must outlive `return agent` / `yield` or it reverts to the real (non-trusted) verdict.
+    with patch("agent.turn_final_response.answer_in_reasoning_capability", return_value=True):
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://api.deepseek.com/v1",
+                model="deepseek-reasoner",
+                provider="deepseek",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+            agent._cached_system_prompt = "You are helpful."
+            agent._use_prompt_caching = False
+            agent.compression_enabled = False
+            agent.save_trajectories = False
+        yield agent
 
 
 REASONING = "Let me parse the dump file to find the crash module. MINIDUMP layout (Windows x64, MINI..."
