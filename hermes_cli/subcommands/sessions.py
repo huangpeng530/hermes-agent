@@ -279,6 +279,16 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "--report", type=Path, help="JSON report path (defaults to <output>.recovery.json)")
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
+
+    sessions_timeline = sessions_subparsers.add_parser(
+        "timeline", help="Cross-compression prompt timeline (prompts + wall-clock timestamps)")
+    sessions_timeline.add_argument("session_id", help="Session ID or unique prefix")
+    sessions_timeline.add_argument("--limit", type=int, default=200,
+        help="Max prompts to show in the tip segment (default: 200)")
+    sessions_timeline.add_argument("--segments", action="store_true",
+        help="Compact view: only the compression segment chain and boundary times, no prompts")
+    _flag(sessions_timeline, "--json", help="Machine-readable JSON (lineage + all prompts + timestamps)")
+
     _add_rename_and_discard(sessions_subparsers)
 
     sessions_pin = sessions_subparsers.add_parser(

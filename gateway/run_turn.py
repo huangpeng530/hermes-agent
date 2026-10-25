@@ -174,6 +174,18 @@ from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
+    # failure_reason values whose terminal failed turns are worth an AUTO-continuation:
+    # the provider stream's retry budget was spent on a TRANSIENT fault (thinking-stage
+    # ReadTimeout, peer-closed, 5xx overload). Every value here is classified retryable,
+    # so the main loop already did its own backoff/rotation/fallback first — reaching here
+    # means the whole budget was genuinely exhausted, not a client error (4xx/401/billing
+    # are non-retryable and never appear).
+    _TRANSIENT_AUTOCONTINUE_REASONS = frozenset(
+        {"timeout", "overloaded", "server_error", "unknown"})
+
+    # Default auto-continuation budget per failure episode when the config section is absent.
+    _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS = 3
+
 
     def _event_thread_metadata(self, event, source):
         """Thread metadata for a send that replies to ``event`` on ``source``."""
@@ -319,7 +331,20 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
             if agent_failed_early and not is_context_overflow_failure:
-                response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
+                _transient_resume = await self._hmwa_maybe_transient_auto_continue(
+                    agent_result, source, session_key, session_entry)
+                _notice = self._hmwa_failed_turn_notice(agent_result)
+                if _transient_resume:
+                    _notice += (
+                        f" Resuming automatically (attempt {_transient_resume[0]}/{_transient_resume[1]}) "
+                        "— no need to resend.")
+                response = self._hmwa_add_failed_turn_notice(response, _notice)
+            # Second live-process gap, orthogonal to the failed-turn branch above: the turn
+            # reported "complete" yet its visible answer is a truncated planning monologue
+            # (reasoning-only clean stop after real tool work). Self-gates on the
+            # reasoning_only_stall flag; its own per-episode budget.
+            await self._hmwa_maybe_reasoning_stall_auto_continue(
+                agent_result, source, session_key, session_entry)
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
