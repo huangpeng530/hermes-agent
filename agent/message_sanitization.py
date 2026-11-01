@@ -729,6 +729,16 @@ def route_reasoning_carriers(provider: Any, base_url: Any) -> frozenset:
         from agent.model_metadata import is_local_endpoint
 
         carriers = _LOCAL_CARRIERS if base_url and is_local_endpoint(str(base_url)) else _DEFAULT_CARRIERS
+    elif carriers == _LOCAL_CARRIERS and provider_lower == "custom" and base_url:
+        # A user-defined ``custom`` provider matches the local-engine row even when it points at a
+        # REMOTE OpenAI-compatible relay. The dual-key shape (vLLM/Ollama split the reasoning keys)
+        # is only safe on a local endpoint: relays that alias ``reasoning`` onto ``reasoning_content``
+        # (NVIDIA NIM / serde) 400 with "duplicate field" when both ride the wire. Demote to the
+        # canonical single carrier; a runtime rejection still records the per-route drop.
+        from agent.model_metadata import is_local_endpoint
+
+        if not is_local_endpoint(str(base_url)):
+            carriers = _DEFAULT_CARRIERS
     if RD not in carriers and carriers and _profile_declares_native_details(provider_lower):
         carriers = carriers | {RD}
     return carriers
@@ -920,6 +930,10 @@ _UNKNOWN_FIELD_PHRASES = (
     "extra inputs are not permitted", "is unsupported", "no such field", "unknown field",
     "unrecognized request argument", "unrecognized field", "unknown parameter", "unexpected field",
     "additional propert", "unknown key",
+    # serde (Rust) gateway bodies: axum/Rocket 400s that name the offending key, incl. a key that
+    # the schema aliases onto another ("duplicate field `reasoning_content`" when both ``reasoning``
+    # and ``reasoning_content`` are sent — NVIDIA NIM aliases them).
+    "duplicate field", "failed to deserialize",
 )
 _NAMED_FIELD_RES = {
     RC: re.compile(r"(?<![\w])reasoning_content(?![\w])"),
