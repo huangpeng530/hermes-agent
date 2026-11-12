@@ -172,6 +172,18 @@ from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
 class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
+    # failure_reason values whose terminal failed turns are worth an AUTO-continuation:
+    # the provider stream's retry budget was spent on a TRANSIENT fault (thinking-stage
+    # ReadTimeout, peer-closed, 5xx overload). Every value here is classified retryable,
+    # so the main loop already did its own backoff/rotation/fallback first — reaching here
+    # means the whole budget was genuinely exhausted, not a client error (4xx/401/billing
+    # are non-retryable and never appear).
+    _TRANSIENT_AUTOCONTINUE_REASONS = frozenset(
+        {"timeout", "overloaded", "server_error", "unknown"})
+
+    # Default auto-continuation budget per failure episode when the config section is absent.
+    _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS = 3
+
 
     def _event_thread_metadata(self, event, source):
         """Thread metadata for a send that replies to ``event`` on ``source``."""
