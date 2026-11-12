@@ -739,10 +739,19 @@ def route_reasoning_carriers(provider: Any, base_url: Any) -> frozenset:
     )
     if carriers is None:
         from agent.model_metadata import is_local_endpoint
-
-        carriers = _LOCAL_CARRIERS if base_url and is_local_endpoint(str(base_url)) else _DEFAULT_CARRIERS
+        # Guard for non-standard-schemas upstream relays (e.g. NVIDIA NIM treats
+        # `reasoning` as alias of `reasoning_content` and rejects duplicate keys).
+        if provider_lower == "custom" and base_url and not is_local_endpoint(str(base_url)):
+            carriers = frozenset({RC})
+        else:
+            carriers = _LOCAL_CARRIERS if base_url and is_local_endpoint(str(base_url)) else _DEFAULT_CARRIERS
     if RD not in carriers and carriers and _profile_declares_native_details(provider_lower):
         carriers = carriers | {RD}
+    # Guard: non-standard upstream relays (e.g. NVIDIA NIM) treat `reasoning` as alias of
+    # `reasoning_content` and reject duplicate keys. Drop R for remote custom providers.
+    from agent.model_metadata import is_local_endpoint
+    if provider_lower == "custom" and base_url and not is_local_endpoint(str(base_url)):
+        carriers = frozenset({RC})
     return carriers
 
 
@@ -932,6 +941,7 @@ _UNKNOWN_FIELD_PHRASES = (
     "extra inputs are not permitted", "is unsupported", "no such field", "unknown field",
     "unrecognized request argument", "unrecognized field", "unknown parameter", "unexpected field",
     "additional propert", "unknown key",
+    "duplicate field", "failed to deserialize",
 )
 _NAMED_FIELD_RES = {
     RC: re.compile(r"(?<![\w])reasoning_content(?![\w])"),

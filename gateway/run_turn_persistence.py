@@ -22,7 +22,7 @@ from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -794,6 +794,135 @@ class GatewayTurnPersistenceMixin:
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         ), error=local_error)
 
+    # ── Transient stream auto-continue (per-session counters + queued resume turns) ────
+    # The LIVE-process gap the crash/restart markers don't cover: the provider stream's own
+    # retry budget (HERMES_STREAM_RETRIES) and the main loop's backoff/rotation/fallback are
+    # all spent, the turn dies as a failed result while the gateway process stays up. No
+    # resume_pending marker is set, so nothing auto-resumes — the user has to re-prompt. The
+    # methods below close that gap: durable marker + a synthesized internal resume turn that
+    # the adapter's FIFO drains right after the failed turn.
+
+    def _transient_autocontinue_budget(self) -> dict:
+        """Per-session consecutive-auto-continuation counters (lazily created)."""
+        st = getattr(self, "_transient_autocontinue_attempts", None)
+        if st is None:
+            st = self._transient_autocontinue_attempts = {}
+        return st
+
+    def _transient_auto_continue_config(self) -> tuple:
+        """(enabled, max_attempts) from gateway.transient_auto_continue; defaults when absent."""
+        try:
+            from gateway.run import _load_gateway_config
+            section = (_load_gateway_config().get("gateway") or {}).get("transient_auto_continue") or {}
+            if not isinstance(section, dict):
+                section = {}
+            enabled = bool(section.get("enabled", True))
+            try:
+                max_attempts = int(section.get("max_attempts", _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS))
+            except (TypeError, ValueError):
+                max_attempts = _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS
+        except Exception:
+            enabled, max_attempts = True, _TRANSIENT_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS
+        return enabled, max_attempts
+
+    async def _hmwa_maybe_transient_auto_continue(self, agent_result, source, session_key, session_entry):
+        """Auto-continue the interrupted work after a transiently failed turn (no user re-prompt)."""
+        if not isinstance(agent_result, dict) or not agent_result.get("failed") or not session_key:
+            return None
+        if agent_result.get("compression_exhausted") or agent_result.get("compression_deferred"):
+            return None
+        reason = str(agent_result.get("failure_reason") or "")
+        if reason not in _TRANSIENT_AUTOCONTINUE_REASONS:
+            return None
+        enabled, max_attempts = self._transient_auto_continue_config()
+        attempts = self._transient_autocontinue_budget()
+        count = int(attempts.get(session_key, 0))
+        try:
+            await self.async_session_store.mark_resume_pending(session_key, reason="stream_exhausted")
+        except Exception:
+            logger.debug("transient auto-continue: mark_resume_pending failed for %s", session_key, exc_info=True)
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            logger.info(
+                "Transient stream failure (reason=%s) on session %s — auto-continuation NOT scheduled (enabled=%s max=%d count=%d); durable resume marker keeps next message resuming.",
+                reason, session_key, enabled, max_attempts, count)
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.warning(
+                "Transient stream failure (reason=%s) on session %s — no live adapter; durable resume marker only.",
+                reason, session_key, getattr(getattr(source, "platform", None), "value", source.platform))
+            return None
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+        with suppress(Exception):
+            await adapter.handle_message(event)
+        attempts[session_key] = count + 1
+        logger.info(
+            "Transient stream failure (reason=%s) on session %s — auto-continuing via queued resume turn (attempt %d/%d).",
+            reason, session_key, count + 1, max_attempts)
+        return (count + 1, max_attempts)
+
+    # ── Reasoning-only stall auto-continue (second live-process gap) ────────────────
+    # The turn reported "complete" but its visible answer is a truncated planning monologue:
+    # the model clean-stopped mid-thinking after real tool work (agent-core flag
+    # ``reasoning_only_stall``). No FAILED-turn recovery ever fires for it, so the unfinished
+    # task would just sit there. Same durable-marker + queued-continuation shape.
+
+    def _reasoning_stall_autocontinue_budget(self) -> dict:
+        """Per-session reasoning-stall auto-continuation counters (lazily created)."""
+        st = getattr(self, "_reasoning_stall_autocontinue_attempts", None)
+        if st is None:
+            st = self._reasoning_stall_autocontinue_attempts = {}
+        return st
+
+    def _reasoning_stall_auto_continue_config(self) -> tuple:
+        """(enabled, max_attempts) from gateway.reasoning_stall_auto_continue; defaults when absent."""
+        try:
+            from gateway.run import _load_gateway_config
+            section = (_load_gateway_config().get("gateway") or {}).get("reasoning_stall_auto_continue") or {}
+            if not isinstance(section, dict):
+                section = {}
+            enabled = bool(section.get("enabled", True))
+            try:
+                max_attempts = int(section.get("max_attempts", 3))
+            except (TypeError, ValueError):
+                max_attempts = 3
+        except Exception:
+            enabled, max_attempts = True, 3
+        return enabled, max_attempts
+
+    async def _hmwa_maybe_reasoning_stall_auto_continue(self, agent_result, source, session_key, session_entry):
+        """Auto-continue an UNFINISHED task after a reasoning-only stall (turn reported complete but model stopped mid-planning-monologue)."""
+        if not isinstance(agent_result, dict) or not agent_result.get("reasoning_only_stall") or not session_key:
+            return None
+        if agent_result.get("compression_exhausted") or agent_result.get("compression_deferred"):
+            return None
+        enabled, max_attempts = self._reasoning_stall_auto_continue_config()
+        attempts = self._reasoning_stall_autocontinue_budget()
+        count = int(attempts.get(session_key, 0))
+        try:
+            await self.async_session_store.mark_resume_pending(session_key, reason="reasoning_stall")
+        except Exception:
+            logger.debug("reasoning-stall auto-continue: mark_resume_pending failed for %s", session_key, exc_info=True)
+        if not enabled or max_attempts <= 0 or count >= max_attempts:
+            logger.info(
+                "Reasoning stall on session %s — auto-continuation NOT scheduled (enabled=%s max=%d count=%d); durable marker keeps next message resuming.",
+                session_key, enabled, max_attempts, count)
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            logger.warning(
+                "Reasoning stall on session %s — no live adapter; durable marker only.",
+                session_key, getattr(getattr(source, "platform", None), "value", source.platform))
+            return None
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+        with suppress(Exception):
+            await adapter.handle_message(event)
+        attempts[session_key] = count + 1
+        logger.info(
+            "Reasoning stall on session %s — auto-continuing via queued resume turn (attempt %d/%d).",
+            session_key, count + 1, max_attempts)
+        return (count + 1, max_attempts)
+
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
         logger.info(
@@ -801,3 +930,14 @@ class GatewayTurnPersistenceMixin:
             _quick_key or "?", run_generation,
         )
         self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+
+# ── Transient stream auto-continue (per-session counters + queued resume turns) ────
+# The LIVE-process gap the crash/restart markers don't cover: the provider stream's own
+# retry budget (HERMES_STREAM_RETRIES) and the main loop's backoff/rotation/fallback are
+# all spent, the turn dies as a failed result while the gateway process stays up. No
+# resume_pending marker is set, so nothing auto-resumes — the user has to re-prompt. The
+# methods below close that gap: durable marker + a synthesized internal resume turn that
+# the adapter's FIFO drains right after the failed turn.
+_TRANSIENT_AUTOCONTINUE_REASONS = frozenset(
+    {"timeout", "overloaded", "server_error", "unknown"})
+_TRANSLATE_STALL_AUTOCONTINUE_DEFAULT_MAX_ATTEMPTS = 3

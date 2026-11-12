@@ -305,6 +305,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             )
             if agent_failed_early and not is_context_overflow_failure and automatic_notices_allowed(source):
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
+            # Transient stream failure auto-continue (live-process gap the crash markers don't cover).
+            if agent_failed_early and not is_context_overflow_failure:
+                _transient_resume = await self._hmwa_maybe_transient_auto_continue(
+                    agent_result, source, session_key, session_entry)
+                if _transient_resume:
+                    _resume_notice = (
+                        f" Resuming automatically (attempt {_transient_resume[0]}/{_transient_resume[1]}) "
+                        "— no need to resend.")
+                    response = self._hmwa_add_failed_turn_notice(response, _resume_notice)
+            # Reasoning-only stall auto-continue (second live-process gap).
+            await self._hmwa_maybe_reasoning_stall_auto_continue(
+                agent_result, source, session_key, session_entry)
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
